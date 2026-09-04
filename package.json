@@ -12,6 +12,10 @@
     "Other"
   ],
   "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#212123",
+    "theme": "dark"
+  },
   "keywords": [
     "claude",
     "claude code",
