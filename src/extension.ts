@@ -21,6 +21,13 @@ const FOCUS_FILE = path.join(FOCUS_DIR, `${process.pid}.json`);
 let statusItem: vscode.StatusBarItem;
 
 export function activate(context: vscode.ExtensionContext): void {
+  // The alert window is a Mach-O binary. Marketplace only offers the extension
+  // to macOS, but a hand-installed VSIX lands anywhere.
+  if (process.platform !== "darwin") {
+    vscode.window.showErrorMessage("Claude Floating Alert works on macOS (Apple Silicon) only.");
+    return;
+  }
+
   try {
     syncPayload(context);
   } catch (error) {
@@ -239,13 +246,24 @@ function showTestAlert(): void {
     return;
   }
   const folder = vscode.workspace.workspaceFolders?.[0];
-  execFile(BINARY, [
-    "--subtitle", folder ? path.basename(folder.uri.fsPath) : "Claude Code",
-    "--title", "Test alert",
-    "--body", "This is how the alert looks above every other app.",
-    "--accent", "orange",
-    "--timeout", "8",
-  ]);
+  execFile(
+    BINARY,
+    [
+      "--subtitle", folder ? path.basename(folder.uri.fsPath) : "Claude Code",
+      "--title", "Test alert",
+      "--body", "This is how the alert looks above every other app.",
+      "--accent", "orange",
+      "--timeout", "8",
+    ],
+    (error) => {
+      // The binary is arm64: an Intel Mac cannot run it at all.
+      if (error) {
+        vscode.window.showErrorMessage(
+          `Claude Floating Alert: the alert window would not run (Apple Silicon required) — ${error.message}`
+        );
+      }
+    }
+  );
 }
 
 /** Copy the hook script and the alert binary into the stable install dir. */
