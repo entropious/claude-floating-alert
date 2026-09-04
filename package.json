@@ -3,8 +3,7 @@
   "displayName": "Claude Floating Alert",
   "description": "Floating alert above every app when Claude Code asks for permission, asks a question or finishes a task.",
   "version": "1.0.0",
-  "publisher": "local",
-  "private": true,
+  "publisher": "entro",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
@@ -12,10 +11,22 @@
   "categories": [
     "Other"
   ],
+  "icon": "media/icon.png",
+  "keywords": [
+    "claude",
+    "claude code",
+    "notification",
+    "alert",
+    "hooks"
+  ],
   "activationEvents": [
     "onStartupFinished",
     "onUri"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/entropious/claude-floating-alert.git"
+  },
   "main": "./out/extension.js",
   "contributes": {
     "commands": [

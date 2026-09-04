@@ -133,7 +133,7 @@ function isInside(cwd: string, folder: string): boolean {
  * Handles the link a clicked panel opens: `open` can only raise the window,
  * bringing the chat itself forward is up to whoever lives inside it.
  *
- *   vscode://local.claude-floating-alert/reveal?session=<id>&cwd=<path>&tab=1
+ *   vscode://entro.claude-floating-alert/reveal?session=<id>&cwd=<path>&tab=1
  */
 function revealHandler(): vscode.UriHandler {
   return {

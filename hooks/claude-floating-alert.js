@@ -17,7 +17,7 @@ const RUN_DIR = path.join(ROOT, "run");
 const FOCUS_DIR = path.join(ROOT, "focus");
 const CONFIG_FILE = path.join(ROOT, "config.json");
 /** Deep link a clicked panel opens to bring its chat forward. */
-const REVEAL_URL = "vscode://local.claude-floating-alert/reveal";
+const REVEAL_URL = "vscode://entro.claude-floating-alert/reveal";
 
 const VSCODE_BUNDLE_ID = "com.microsoft.VSCode";
 /** Per-window socket path: the same value in the window's terminals and its
