@@ -1,0 +1,68 @@
+{
+  "name": "claude-floating-alert",
+  "displayName": "Claude Floating Alert",
+  "description": "Floating alert above every app when Claude Code asks for permission, asks a question or finishes a task.",
+  "version": "1.0.0",
+  "publisher": "local",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeFloatingAlert.toggleHooks",
+        "title": "Claude Floating Alert: Toggle Hooks"
+      },
+      {
+        "command": "claudeFloatingAlert.test",
+        "title": "Claude Floating Alert: Show Test Alert"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Floating Alert",
+      "properties": {
+        "claudeFloatingAlert.permission.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an alert when Claude asks for permission to use a tool."
+        },
+        "claudeFloatingAlert.question.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an alert when Claude asks a question (AskUserQuestion)."
+        },
+        "claudeFloatingAlert.stop.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an alert when Claude finishes a task."
+        },
+        "claudeFloatingAlert.stop.timeout": {
+          "type": "number",
+          "default": 3,
+          "description": "Seconds before the task-finished alert closes by itself (0 keeps it on screen)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build:native": "mkdir -p bin && /usr/bin/xcrun swiftc -O -target arm64-apple-macos11 native/ClaudeAlert.swift -o bin/claude-alert",
+    "package": "npm run compile && npm run build:native && npx --yes @vscode/vsce package --no-dependencies --target darwin-arm64"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
