@@ -85,10 +85,6 @@ async function run() {
 
   await check("mirrors the settings into the config the hook reads", () => {
     const config = JSON.parse(fs.readFileSync(path.join(ROOT, "config.json"), "utf-8"));
-    for (const kind of ["permission", "question", "stop"]) {
-      assert.ok(config[kind], `${kind} should be in the config`);
-      assert.strictEqual(typeof config[kind].enabled, "boolean");
-    }
     assert.strictEqual(config.stop.timeout, 3, "the declared default should come through");
   });
 
@@ -107,6 +103,30 @@ async function run() {
     }
   });
 
+  await check("wires its hooks into the Codex hooks file too", () => {
+    const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".codex", "hooks.json"), "utf-8"));
+    const ours = Object.entries(settings.hooks || {}).flatMap(([event, groups]) =>
+      groups.flatMap((group) => (group.hooks || []).filter((hook) => String(hook.command).includes("floating-alert")).map(() => event))
+    );
+    for (const event of ["Stop", "PermissionRequest", "PreToolUse"]) {
+      assert.ok(ours.includes(event), `${event} should be wired for Codex`);
+    }
+    const commands = Object.values(settings.hooks)
+      .flat()
+      .flatMap((group) => group.hooks || [])
+      .map((hook) => String(hook.command))
+      .filter((command) => command.includes("floating-alert"));
+    assert.ok(
+      commands.every((command) => command.includes("--agent codex")),
+      "a Codex registration has to say so, or the alert speaks of Claude"
+    );
+    const stop = settings.hooks.Stop.flatMap((group) => group.hooks || []);
+    assert.ok(
+      stop.some((hook) => String(hook.command).includes("someone-elses-notifier")),
+      "the Codex hook planted before activation should still be there"
+    );
+  });
+
   await check("leaves hooks of other extensions alone", () => {
     const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude", "settings.json"), "utf-8"));
     const stop = settings.hooks.Stop.flatMap((group) => group.hooks || []);
@@ -122,14 +142,19 @@ async function run() {
     assert.ok(commands.includes("claudeFloatingAlert.test"));
   });
 
-  await check("takes its hooks back out again", async () => {
+  await check("takes its hooks back out again, from both agents", async () => {
     await vscode.commands.executeCommand("claudeFloatingAlert.toggleHooks");
-    const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude", "settings.json"), "utf-8"));
-    const mine = Object.values(settings.hooks || {})
-      .flat()
-      .flatMap((group) => group.hooks || [])
-      .filter((hook) => String(hook.command).includes("floating-alert"));
-    assert.strictEqual(mine.length, 0, "the toggle should remove every hook it owns");
+    for (const file of [
+      path.join(os.homedir(), ".claude", "settings.json"),
+      path.join(os.homedir(), ".codex", "hooks.json"),
+    ]) {
+      const settings = JSON.parse(fs.readFileSync(file, "utf-8"));
+      const mine = Object.values(settings.hooks || {})
+        .flat()
+        .flatMap((group) => group.hooks || [])
+        .filter((hook) => String(hook.command).includes("floating-alert"));
+      assert.strictEqual(mine.length, 0, `the toggle should clear ${path.basename(file)}`);
+    }
   });
 
   say(failures.length ? `\n${failures.length} failed` : "\nall passed");

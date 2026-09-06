@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Codex raises the same alerts. Its hooks go into `~/.codex/hooks.json` — where
+  Codex is set up — next to whatever is already wired there, and the alert says
+  which of the two agents is waiting. A click opens the Codex panel; the chat
+  inside it is beyond reach, so a focused window counts as a chat being watched.
+- Codex runs a hook only once it is trusted, and skips an untrusted one without
+  a word, so the wiring is followed by a notice saying where that is granted.
+- The per-kind switches are gone. The bell in the status bar turns every alert
+  on and off, and `claudeFloatingAlert.stop.timeout` is the only setting left.
+
 ## 1.1.2
 
 - A session in a nested folder raises the window closest around it. With the

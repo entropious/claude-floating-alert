@@ -54,6 +54,21 @@ function makeSandbox() {
       2
     )
   );
+  // Codex is only wired where it is already set up, so the sandbox pretends it
+  // is — with a hook of someone else's, which has to survive the wiring.
+  fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".codex", "hooks.json"),
+    JSON.stringify(
+      {
+        hooks: {
+          Stop: [{ hooks: [{ type: "command", command: "node /opt/someone-elses-notifier.js" }] }],
+        },
+      },
+      null,
+      2
+    )
+  );
   return home;
 }
 

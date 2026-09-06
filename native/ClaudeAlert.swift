@@ -276,9 +276,20 @@ final class Controller: NSObject {
         guard !opts.url.isEmpty else { return }
         // `open` returns before the window is actually in front, and a link
         // arriving too early finds no window to belong to — VS Code then opens
-        // an empty one for it.
-        Thread.sleep(forTimeInterval: 0.6)
+        // an empty one for it. Waiting for the app to come forward costs
+        // nothing when it already is, which is the common case for a click.
+        waitUntilFront()
         runOpen([opts.url])
+    }
+
+    /// Blocks until the editor is the frontmost app, or until the wait has gone
+    /// on long enough to be a failure rather than a slow activation.
+    private func waitUntilFront() {
+        let deadline = Date().addingTimeInterval(0.5)
+        while Date() < deadline {
+            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == opts.bundleID { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
     }
 
     private func runOpen(_ arguments: [String]) {

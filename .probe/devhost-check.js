@@ -7,7 +7,9 @@
 //   surfaces               что расширение Claude Code пишет о своих чатах
 //   focus                  что окна пишут о своём фокусе
 //   alerts                 живые процессы алерта и с какими аргументами
-//   fire <kind> [session]  прогнать хук так, будто событие пришло от Claude Code
+//   fire <kind> [session] [agent]
+//                          прогнать хук так, будто событие пришло от агента
+//   codex                  запускает ли Codex наши хуки, и мешает ли доверие
 //   shot [файл]            снимок окна средствами самого редактора
 
 const fs = require("fs");
@@ -17,6 +19,8 @@ const { execFileSync, spawnSync } = require("child_process");
 
 const PORT = process.env.CDP_PORT || 9333;
 const ROOT = path.join(os.homedir(), ".claude", "floating-alert");
+/** По одному файлу на живой алерт — так видно, что хук до него дошёл. */
+const RUN_DIR = path.join(ROOT, "run");
 
 async function targets() {
   const res = await fetch(`http://127.0.0.1:${PORT}/json/list`);
@@ -225,22 +229,89 @@ function sessionHere() {
   return best.session;
 }
 
-/** Событие в том виде, в каком его присылает Claude Code. */
-function fire(kind, session) {
+/** Событие в том виде, в каком его присылает агент. */
+function fire(kind, session, agent) {
   const payload = {
-    session_id: session || sessionHere() || "00000000-0000-4000-8000-000000000000",
+    session_id: session || (agent ? "" : sessionHere()) || "00000000-0000-4000-8000-000000000000",
     cwd: workspace(),
     tool_name: "Bash",
     tool_input: { command: "rm -rf build", question: "Проверка стенда?" },
   };
   const hook = path.join(ROOT, "claude-floating-alert.js");
-  execFileSync("node", [hook, kind], {
+  execFileSync("node", agent ? [hook, kind, "--agent", agent] : [hook, kind], {
     input: JSON.stringify(payload),
     stdio: ["pipe", "inherit", "inherit"],
     // Хук молчит по многим причинам сразу; пусть скажет, по какой именно.
     env: { ...process.env, CFA_DEBUG: "1" },
   });
-  console.log(`хук отработал: ${kind}`);
+  console.log(`хук отработал: ${kind}${agent ? ` (${agent})` : ""}`);
+}
+
+/**
+ * Запускается ли хук самим Codex. Записи в hooks.json — половина дела: Codex
+ * держит их отключёнными, пока им не выдано доверие, и молча пропускает.
+ *
+ * Проверка идёт как есть, без обхода доверия: один прогон Codex и взгляд в его
+ * конфиг. Доверие выдаётся только в самом Codex, и стенд лишь показывает,
+ * выдано оно или нет.
+ *
+ * Прогон идёт в каталоге, который не открыт ни в одном окне: иначе алерт
+ * подавится тем, что окно в фокусе, и молчание будет означать совсем другое.
+ */
+function codexTrust() {
+  const codex = fs
+    .readdirSync(path.join(os.homedir(), ".vscode", "extensions"))
+    .filter((name) => name.startsWith("openai.chatgpt-"))
+    .map((name) => path.join(os.homedir(), ".vscode", "extensions", name, "bin", "macos-aarch64", "codex"))
+    .find((file) => fs.existsSync(file));
+  if (!codex) return console.log("Codex не установлен — проверять нечего");
+
+  const hooksFile = path.join(os.homedir(), ".codex", "hooks.json");
+  let ours = 0;
+  try {
+    const hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")).hooks || {};
+    for (const groups of Object.values(hooks)) {
+      for (const group of groups) {
+        ours += (group.hooks || []).filter((h) => String(h.command).includes("floating-alert")).length;
+      }
+    }
+  } catch {}
+  console.log(`наших записей в hooks.json:   ${ours}`);
+
+  // Доверие Codex хранит хешем в своём конфиге; пока секции нет, не доверен
+  // ни один хук — ни наш, ни чужой.
+  let trusted = false;
+  try {
+    trusted = /trusted_hash/.test(fs.readFileSync(path.join(os.homedir(), ".codex", "config.toml"), "utf-8"));
+  } catch {}
+  console.log(`доверие в config.toml:        ${trusted ? "есть" : "нет ни одного"}`);
+
+  const cwd = fs.mkdtempSync(path.join(ROOT, "probe-codex-"));
+  let ran = null;
+  try {
+    const before = new Set(fs.readdirSync(RUN_DIR));
+    try {
+      execFileSync(codex, ["exec", "--skip-git-repo-check", "reply with the single word ok"], {
+        cwd,
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      ran = fs.readdirSync(RUN_DIR).some((name) => !before.has(name));
+    } catch {
+      console.log("Codex не отработал прогон — смотрите его вывод вручную");
+    }
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+  console.log(`хук от Codex:                 ${ran ? "отработал" : "молчит"}`);
+
+  if (ours > 0 && !ran) {
+    console.log(
+      trusted
+        ? "\nзаписи на месте и что-то доверено, но наш хук не запустился — смотрите Hooks в Codex поштучно."
+        : "\nдиагноз: записи есть, доверия нет. Доверить можно только в самом Codex:"
+    );
+    if (!trusted) console.log("панель Codex → настройки → Hooks, либо `codex` в терминале — он спросит на старте.");
+  }
 }
 
 async function main() {
@@ -365,10 +436,13 @@ async function main() {
       alerts();
       break;
     case "fire":
-      fire(rest[0] || "stop", rest[1]);
+      fire(rest[0] || "stop", rest[1], rest[2]);
+      break;
+    case "codex":
+      codexTrust();
       break;
     default:
-      console.error("команды: targets | command | eval | surfaces | focus | alerts | fire");
+      console.error("команды: targets | command | eval | surfaces | focus | alerts | fire | codex");
       process.exit(1);
   }
 }

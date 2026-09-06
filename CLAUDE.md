@@ -1,21 +1,45 @@
 # Working on this repository
 
-A VS Code extension that puts an alert above every window when Claude Code needs
-the user. macOS on Apple Silicon only — the alert is a Swift binary shipped
-inside the `.vsix`.
+A VS Code extension that puts an alert above every window when Claude Code or
+Codex needs the user. macOS on Apple Silicon only — the alert is a Swift binary
+shipped inside the `.vsix`.
 
 ## The three moving parts
 
 | | |
 |---|---|
 | `src/` → `out/` | The extension. Publishes window focus, installs the hooks, handles the `vscode://` link a clicked alert opens. |
-| `hooks/claude-floating-alert.js` | Runs as a Claude Code hook, decides whether an alert is warranted, spawns it detached. Plain Node, no build step. |
+| `hooks/claude-floating-alert.js` | Runs as a hook of either agent, decides whether an alert is warranted, spawns it detached. Plain Node, no build step. |
 | `native/ClaudeAlert.swift` → `bin/claude-alert` | The panel itself: `NSPanel` at `.screenSaver` level, `.accessory` policy. Built by `npm run build:native`. |
 
 They meet in `~/.claude/floating-alert/`, which the extension fills on
 activation: the hook script, the binary, `config.json` (settings mirrored for
 the hook), `focus/<pid>.json` (one per window), `run/<session>.json` (one per
 live alert). The path is stable across extension updates, which is the point.
+
+## Two agents, one hook
+
+Codex fires the same three events from `~/.codex/hooks.json`, in the same file
+shape as `~/.claude/settings.json`, with a payload carrying the same
+`session_id`, `cwd` and `tool_input`. Its registrations pass `--agent codex`,
+and that argument is the only thing telling the two apart: it names the agent on
+the alert and puts `agent=codex` in the link, which sends a click to the Codex
+panel (`chatgpt.openSidebar`) instead of a Claude chat.
+
+**Writing the file is not enough.** Codex keeps a hash of every hook it has been
+shown and runs only the ones the user has trusted; a new or changed entry is
+skipped in silence, with nothing in the logs to say so. Trust is granted in the
+Codex UI (its panel → settings → Hooks) and nowhere else — the extension says so
+once, right after wiring, and `.probe/devhost.sh codex` reports whether it has
+been granted. Codex takes a flag to run untrusted hooks anyway; it defeats the
+mechanism, and neither the extension nor the stand uses it.
+
+Everything below about deciding whether the chat is watched is about Claude Code
+alone. A Codex chat sits in a webview of another extension: nothing reports the
+session behind it, its tabs carry no label to match, and the panel's visibility
+is not something the API here can ask about. So a focused window is taken to
+mean the Codex chat is being watched, and there is no surface to reveal — only
+the panel.
 
 ## The one hard question
 
@@ -57,8 +81,10 @@ pid, or a field it does not know must fall through to 2 and 3.
   one.
 - **Visibility is read at the moment of writing, never remembered.** A view
   restored with the window resolves hidden and no change event follows.
-- **Hooks of other extensions are left alone**, and `~/.claude/settings.json` is
-  backed up before the first change.
+- **Hooks of other extensions are left alone**, and each hook file is backed up
+  before the first change.
+- **Codex is wired only where `~/.codex` exists.** Creating it for someone
+  without Codex would leave a file nothing ever reads.
 
 ## Building and testing
 
@@ -91,6 +117,8 @@ bash .probe/devhost.sh surfaces        # what Claude Code says about its chats
 bash .probe/devhost.sh case watched    # chat on screen  → expect no alert
 bash .probe/devhost.sh case hidden     # side bar hidden → expect an alert
 bash .probe/devhost.sh case tab        # chat tab behind → expect an alert
+bash .probe/devhost.sh case codex      # event from Codex, window focused or not
+bash .probe/devhost.sh codex           # does Codex run our hooks, or is trust missing
 ```
 
 Worth knowing before extending it:

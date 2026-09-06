@@ -22,6 +22,9 @@
 #   bash .probe/devhost.sh case tab         сценарий: чат во вкладке за другой → ждём алерт
 #   bash .probe/devhost.sh case watched     сценарий: чат перед глазами → алерта быть не должно
 #
+#   bash .probe/devhost.sh codex            запускает ли Codex наши хуки (доверие)
+#   bash .probe/devhost.sh case codex       сценарий: событие Codex → ждём алерт со ссылкой на панель
+#
 # Окно запускается один раз и само себя не перезапускает: пересборка
 # подхватывается только явным restart.
 set -u
@@ -108,7 +111,7 @@ restart)
 	bash "$0" stop; bash "$0" start
 	;;
 
-surfaces|focus|alerts|targets|shot|front)
+surfaces|focus|alerts|targets|shot|front|codex)
 	"${CHECK[@]}" "$@"
 	;;
 
@@ -150,7 +153,7 @@ explorer) "${CHECK[@]}" command "View: Show Explorer" ;;
 
 fire)
 	kill_alerts
-	"${CHECK[@]}" fire "${2:-stop}" "${3:-}"
+	"${CHECK[@]}" fire "${2:-stop}" "${3:-}" "${4:-}"
 	sleep 1
 	"${CHECK[@]}" alerts
 	;;
@@ -190,8 +193,21 @@ case)
 		bash "$0" fire stop
 		echo "ожидание: алерта нет"
 		;;
+	codex)
+		echo "== событие Codex: панель видна только ему, решает фокус окна"
+		bash "$0" raise || exit 1
+		echo "-- окно в фокусе"
+		bash "$0" fire stop "" codex
+		echo "ожидание: алерта нет"
+		# Фокус уводится на Finder: чат Codex ничем не отличим от любого другого
+		# содержимого окна, и единственный признак — что окна нет перед глазами.
+		open -a Finder; sleep 2
+		echo "-- фокус уведён на Finder"
+		bash "$0" fire permission "" codex
+		echo "ожидание: алерт есть, в ссылке agent=codex"
+		;;
 	*)
-		echo "сценарии: hidden | tab | watched"; exit 1
+		echo "сценарии: hidden | tab | watched | codex"; exit 1
 		;;
 	esac
 	;;

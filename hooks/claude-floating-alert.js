@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Claude Floating Alert — hook entry point.
 //
-// Claude Code pipes the hook payload as JSON on stdin; the event kind comes in
-// as argv[2] (permission | question | stop). The panel is
+// The agent pipes the hook payload as JSON on stdin; the event kind comes in
+// as argv[2] (permission | question | stop), and `--agent codex` marks the
+// registrations Codex runs — a bare invocation is Claude Code. The panel is
 // spawned detached so the hook returns immediately and never blocks the CLI.
 
 const fs = require("fs");
@@ -29,6 +30,16 @@ const WINDOW_ID = process.env.VSCODE_IPC_HOOK_CLI || "";
 /** Kinds that wait for an answer: they outrank the purely informational ones. */
 const BLOCKING = new Set(["permission", "question"]);
 
+/** Agents whose hooks land here, and the name the panel calls them by. */
+const AGENTS = { claude: "Claude", codex: "Codex" };
+
+/** Which agent fired this event: Codex registrations pass `--agent codex`. */
+function agentId(argv) {
+  const at = argv.indexOf("--agent");
+  const id = at >= 0 ? argv[at + 1] : "";
+  return Object.prototype.hasOwnProperty.call(AGENTS, id) ? id : "claude";
+}
+
 /** How much of a transcript's tail to scan for the session title. */
 const TITLE_SCAN_BYTES = 512 * 1024;
 
@@ -39,9 +50,9 @@ const HEAD_SCAN_BYTES = 64 * 1024;
 const UNTITLED_TAB = "Claude Code";
 
 const DEFAULTS = {
-  permission: { enabled: true, accent: "orange", timeout: 0 },
-  question: { enabled: true, accent: "purple", timeout: 0 },
-  stop: { enabled: true, accent: "green", timeout: 3 },
+  permission: { accent: "orange", timeout: 0 },
+  question: { accent: "purple", timeout: 0 },
+  stop: { accent: "green", timeout: 3 },
 };
 
 function readConfig() {
@@ -77,8 +88,8 @@ function toolDetail(input) {
   return "";
 }
 
-function workspaceName(cwd) {
-  if (!cwd) return "Claude Code";
+function workspaceName(cwd, agent) {
+  if (!cwd) return AGENTS[agent];
   return path.basename(cwd) || cwd;
 }
 
@@ -340,9 +351,14 @@ function sessionIsInTab(cwd, sessionId) {
   );
 }
 
-function sessionIsWatched(cwd, sessionId) {
+function sessionIsWatched(cwd, sessionId, agent) {
   const window = focusedWindow(cwd);
   if (!window) return false;
+
+  // A Codex chat lives in a panel of the window, which no API here can see
+  // into: nothing names the session behind it and nothing says whether it is on
+  // screen. The focused window is all there is to go on.
+  if (agent === "codex") return true;
 
   // A patched Claude Code names the session behind every surface, so the answer
   // is exact: this chat is in front of the user, or it is not.
@@ -360,24 +376,25 @@ function sessionIsWatched(cwd, sessionId) {
   return true;
 }
 
-function compose(kind, input) {
+function compose(kind, input, agent) {
   const cwd = input.cwd || "";
-  const subtitle = workspaceName(cwd);
+  const subtitle = workspaceName(cwd, agent);
+  const name = AGENTS[agent];
   switch (kind) {
     case "permission":
       return {
         subtitle,
-        title: "Permission needed",
+        title: `${name} needs permission`,
         body: [input.tool_name, toolDetail(input)].filter(Boolean).join(" · "),
       };
     case "question":
       return {
         subtitle,
-        title: "Claude asked a question",
+        title: `${name} asked a question`,
         body: truncate((input.tool_input || {}).question || "Your choice is needed", BODY_MAX),
       };
     default:
-      return { subtitle, title: "Claude is done", body: "Task finished, waiting for you." };
+      return { subtitle, title: `${name} is done`, body: "Task finished, waiting for you." };
   }
 }
 
@@ -387,16 +404,16 @@ function explain(reason) {
   if (process.env.CFA_DEBUG) process.stderr.write(`claude-floating-alert: ${reason}\n`);
 }
 
-function main(kind, input) {
+function main(kind, input, agent) {
   const cwd = input.cwd || "";
   const session = input.session_id;
 
   // An unknown kind means a stale hook entry from an older install.
   const config = readConfig()[kind];
-  if (!config || !config.enabled) return explain(`kind ${kind} is off`);
+  if (!config) return explain(`unknown kind ${kind}`);
   if (!fs.existsSync(BINARY)) return explain("no alert binary installed");
 
-  if (sessionIsWatched(cwd, session)) return explain("the chat is in front of the user");
+  if (sessionIsWatched(cwd, session, agent)) return explain("the chat is in front of the user");
 
   // A self-closing panel must not replace one that waits for an answer.
   const previous = livePanel(session);
@@ -404,15 +421,18 @@ function main(kind, input) {
     return explain(`a ${previous.kind} alert is still waiting for an answer`);
   }
 
-  const { subtitle, title, body } = compose(kind, input);
+  const { subtitle, title, body } = compose(kind, input, agent);
   // The folder raises the window that has it open; the link then tells that
   // window which chat to bring forward. Without a window to receive it the link
   // would make VS Code open an empty one, so it is only sent when one is there.
   const link = windowsFor(cwd).length
     ? `${REVEAL_URL}?${new URLSearchParams({
+        agent,
         session: session || "",
         cwd,
-        tab: sessionIsInTab(cwd, session) ? "1" : "0",
+        // A Codex chat is opened by its panel, which takes no session: the flag
+        // stays out of the link rather than carrying an answer nobody uses.
+        ...(agent === "codex" ? {} : { tab: sessionIsInTab(cwd, session) ? "1" : "0" }),
       })}`
     : "";
 
@@ -446,7 +466,7 @@ process.stdin.on("end", () => {
     input = JSON.parse(raw);
   } catch {}
   try {
-    main(kind, input);
+    main(kind, input, agentId(process.argv));
   } catch {}
   process.exit(0);
 });

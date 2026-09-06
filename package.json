@@ -1,7 +1,7 @@
 {
   "name": "claude-floating-alert",
   "displayName": "Claude Floating Alert",
-  "description": "Floating alert above every app when Claude Code asks for permission, asks a question or finishes a task.",
+  "description": "Floating alert above every app when Claude Code or Codex asks for permission, asks a question or finishes a task.",
   "version": "1.1.2",
   "publisher": "entro",
   "license": "MIT",
@@ -19,6 +19,7 @@
   "keywords": [
     "claude",
     "claude code",
+    "codex",
     "notification",
     "alert",
     "hooks"
@@ -46,21 +47,6 @@
     "configuration": {
       "title": "Claude Floating Alert",
       "properties": {
-        "claudeFloatingAlert.permission.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show an alert when Claude asks for permission to use a tool."
-        },
-        "claudeFloatingAlert.question.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show an alert when Claude asks a question (AskUserQuestion)."
-        },
-        "claudeFloatingAlert.stop.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show an alert when Claude finishes a task."
-        },
         "claudeFloatingAlert.stop.timeout": {
           "type": "number",
           "default": 3,

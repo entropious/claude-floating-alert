@@ -140,7 +140,7 @@ function isInside(cwd: string, folder: string): boolean {
  * Handles the link a clicked panel opens: `open` can only raise the window,
  * bringing the chat itself forward is up to whoever lives inside it.
  *
- *   vscode://entro.claude-floating-alert/reveal?session=<id>&cwd=<path>&tab=1
+ *   vscode://entro.claude-floating-alert/reveal?agent=claude&session=<id>&cwd=<path>&tab=1
  */
 function revealHandler(): vscode.UriHandler {
   return {
@@ -151,15 +151,25 @@ function revealHandler(): vscode.UriHandler {
       // The link lands in one window; ignore it unless the chat belongs here.
       if (!cwd || !workspacePaths().some((folder) => isInside(cwd, folder))) return;
 
+      if (query.get("agent") === "codex") {
+        // Codex takes no session anywhere: its panel opens on whatever chat it
+        // was left on, which is the one the alert came from. The command reveals
+        // the container and focuses the view itself, in whichever side bar this
+        // editor puts the panel — a `<view>.focus` of our own would only be the
+        // same work again, and the one for the side bar the panel is not in
+        // costs a wait on the extension activation of a command that is missing.
+        await run("chatgpt.openSidebar");
+        return;
+      }
+
       if (query.get("tab") === "1") {
         await run("claude-vscode.editor.open", query.get("session") || undefined);
         return;
       }
       // A side bar chat has no tab to reveal, and the reveal command would open
-      // a second copy of it in the editor. Open the side bar, then focus the
-      // view in case it was open all along and opening it was a no-op.
+      // a second copy of it in the editor. The side bar command focuses its own
+      // view, so nothing else is needed here either.
       await run("claude-vscode.sidebar.open");
-      await run("claudeVSCodeSidebarSecondary.focus");
     },
   };
 }
@@ -204,12 +214,24 @@ function dismissOwnPanels(): void {
   }
 }
 
-/** Wire the hooks once, right after install; the toggle owns them afterwards. */
+/**
+ * Wire the hooks once, right after install; the toggle owns them afterwards.
+ *
+ * The key carries the set of agents that bootstrap covers. An install that
+ * predates Codex has the older key and is wired again, once, so that its Codex
+ * registrations appear — unless the user has turned the hooks off, which is an
+ * answer bootstrap does not overrule.
+ */
 function bootstrapHooks(context: vscode.ExtensionContext): void {
-  if (context.globalState.get<boolean>("bootstrapped")) return;
+  if (context.globalState.get<boolean>("bootstrapped.codex")) return;
+  const wired = hooksInstalled();
+  const before = context.globalState.get<boolean>("bootstrapped");
   try {
-    if (!hooksInstalled()) installHooks();
+    // Wired already: an older install, brought up to date. Never wired: a fresh
+    // one. Wired once and switched off since: left as the user put it.
+    if (wired ? before : !before) void askCodexToTrust(installHooks());
     context.globalState.update("bootstrapped", true);
+    context.globalState.update("bootstrapped.codex", true);
   } catch (error) {
     vscode.window.showErrorMessage(`Claude Floating Alert: could not write the hooks — ${error}`);
   }
@@ -224,13 +246,30 @@ function refreshStatus(): void {
   statusItem.show();
 }
 
+/**
+ * Writing `~/.codex/hooks.json` is only half of it: Codex keeps a hash of every
+ * hook it has been shown and skips, without a word, the ones that are new or
+ * changed. Nothing here can grant that trust — it is the point of the mechanism
+ * — so the one useful thing is to say where it is granted.
+ */
+async function askCodexToTrust(written: { codex: boolean }): Promise<void> {
+  if (!written.codex) return;
+  const open = "Open Codex";
+  const answer = await vscode.window.showInformationMessage(
+    "Claude Floating Alert wired its hooks into Codex. Codex runs them only once you trust them: open its panel, then Hooks in the settings.",
+    open
+  );
+  if (answer === open) await run("chatgpt.openSidebar");
+}
+
 async function toggleHooks(): Promise<void> {
   try {
-    // The status bar item is the feedback: no notification needed.
+    // The status bar item is the feedback for switching off; switching on has
+    // the Codex notice, which the toggle is the usual way to reach.
     if (hooksInstalled()) {
       uninstallHooks();
     } else {
-      installHooks();
+      void askCodexToTrust(installHooks());
     }
   } catch (error) {
     vscode.window.showErrorMessage(`Claude Floating Alert: could not update settings.json — ${error}`);
@@ -290,13 +329,7 @@ function syncPayload(context: vscode.ExtensionContext): void {
 function writeRuntimeConfig(): void {
   const config = vscode.workspace.getConfiguration("claudeFloatingAlert");
   const runtime = {
-    permission: { enabled: config.get<boolean>("permission.enabled"), accent: "orange", timeout: 0 },
-    question: { enabled: config.get<boolean>("question.enabled"), accent: "purple", timeout: 0 },
-    stop: {
-      enabled: config.get<boolean>("stop.enabled"),
-      accent: "green",
-      timeout: config.get<number>("stop.timeout"),
-    },
+    stop: { timeout: config.get<number>("stop.timeout") },
   };
   try {
     fs.mkdirSync(INSTALL_DIR, { recursive: true });
