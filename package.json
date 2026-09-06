@@ -2,7 +2,7 @@
   "name": "claude-floating-alert",
   "displayName": "Claude Floating Alert",
   "description": "Floating alert above every app when Claude Code asks for permission, asks a question or finishes a task.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "entro",
   "license": "MIT",
   "engines": {

@@ -260,7 +260,9 @@ function chatSurfaces(pid) {
     return null;
   }
   if (!isAlive(state.pid)) return null;
-  return state.surfaces || [];
+  // The sessions list is a webview of its own and names a session without ever
+  // showing it; a report that predates the distinction marks nothing.
+  return (state.surfaces || []).filter((surface) => surface.chat !== false);
 }
 
 /** The surfaces holding one session, across every reporting window. */
@@ -317,7 +319,14 @@ function windowFolder(cwd, sessionId) {
  */
 function sessionIsInTab(cwd, sessionId) {
   const reported = surfacesOf(sessionId);
-  if (reported.length > 0) return reported.some((surface) => surface.kind === "tab");
+  if (reported.length > 0) {
+    // A session can sit in a tab and in the side bar at once. The link has to
+    // name the one the user last worked in, not whichever exists.
+    const latest = reported.reduce((best, surface) =>
+      (surface.activeAt || 0) > (best.activeAt || 0) ? surface : best
+    );
+    return latest.kind === "tab";
+  }
 
   const marks = sessionMarks(cwd, sessionId);
   return windowsFor(cwd).some((state) =>

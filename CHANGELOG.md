@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1
+
+- A clicked alert opens the chat where the session was last worked in. A session
+  open in a tab and in the side bar at once used to raise the tab, even when it
+  sat behind other tabs and the side bar was the one being used.
+- The sessions list no longer counts as a chat on screen: it names a session
+  without ever showing it.
+
 ## 1.1.0
 
 - A chat that is not on screen no longer counts as watched. Where a Claude Code
