@@ -124,16 +124,14 @@ raise)
 	# активируется: у стенда свой профиль, то есть отдельный процесс редактора.
 	# Снаружи его не поднять — `open` уводит фокус на рабочее окно, а System
 	# Events отвечает "Not authorised to send Apple events".
-	"${CHECK[@]}" front > /dev/null
-	for _ in $(seq 1 3); do
-		"${CHECK[@]}" focus | grep -q "в фокусе.*workspace" && exit 0
-		sleep 1
-	done
-	echo "перейдите в окно стенда (.probe/workspace) — жду до 30с"
-	for _ in $(seq 1 30); do
-		"${CHECK[@]}" focus | grep -q "в фокусе.*workspace" && { echo "окно в фокусе"; exit 0; }
-		sleep 1
-	done
+	# Свежее окно поднимается активным, так что рычаг на крайний случай —
+	# перезапуск. Состояние он и так сбрасывает: сценарии начинаются с него.
+	focused() { "${CHECK[@]}" focus | grep -q "в фокусе.*workspace"; }
+	"${CHECK[@]}" front > /dev/null 2>&1
+	for _ in $(seq 1 10); do focused && exit 0; sleep 1; done
+	bash "$0" restart > /dev/null
+	"${CHECK[@]}" front > /dev/null 2>&1
+	for _ in $(seq 1 15); do focused && exit 0; sleep 1; done
 	echo "окно так и не получило фокус"; exit 1
 	;;
 

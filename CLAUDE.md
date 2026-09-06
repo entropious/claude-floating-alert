@@ -147,9 +147,12 @@ Worth knowing before extending it:
   clicks the activity bar icon instead.
 - Panel contents live in a nested iframe, so `peek` and `click` search every
   frame of a webview target.
-- `Page.bringToFront` raises the window inside its own process, but cannot
-  activate that process in the system — the stand waits for a click when the
-  scenario needs real focus.
+- An event is only attributed to a window that has focus, so the scenarios need
+  the stand's window in front. `Page.bringToFront` raises it inside its own
+  process but cannot activate that process in the system, and neither can `open`
+  or `code` — they talk to the normal profile. What does work is that a freshly
+  started window comes up active, so `raise` falls back to a restart, which the
+  scenarios do anyway. **No scenario should ever ask the user to click.**
 
 ## Conventions
 
