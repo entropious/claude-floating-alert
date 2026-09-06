@@ -309,7 +309,9 @@ function windowFolder(cwd, sessionId) {
     const folder = (state.folders || []).find((candidate) => isInside(cwd, candidate));
     if (folder) return folder;
   }
-  return cwd;
+  // With no window to raise the answer is empty: a folder no window has open
+  // would open a new one.
+  return "";
 }
 
 /**

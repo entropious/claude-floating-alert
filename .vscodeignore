@@ -1,9 +1,11 @@
 .vscode/**
 .claude/**
+.tmp/**
 node_modules/**
 src/**
 native/**
 scripts/**
+test/**
 out/**/*.map
 tsconfig.json
 tsconfig.tsbuildinfo

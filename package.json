@@ -73,7 +73,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "build:native": "mkdir -p bin && /usr/bin/xcrun swiftc -O -target arm64-apple-macos11 native/ClaudeAlert.swift -o bin/claude-alert",
-    "package": "npm run compile && npm run build:native && npx --yes @vscode/vsce package --no-dependencies --target darwin-arm64"
+    "package": "npm run compile && npm run build:native && npx --yes @vscode/vsce package --no-dependencies --target darwin-arm64",
+    "test": "node test/hook.test.js && node test/vscode/runTests.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

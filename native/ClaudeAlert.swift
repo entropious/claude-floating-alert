@@ -266,14 +266,18 @@ final class Controller: NSObject {
     /// folder; launching the app with the folder as an argument would open a
     /// second window for it instead.
     private func openTarget() {
-        if !opts.folder.isEmpty {
+        if opts.folder.isEmpty {
+            // Nothing to raise by folder: activate the app itself, which brings
+            // its existing windows forward without opening one.
+            runOpen(["-b", opts.bundleID])
+        } else {
             runOpen(["-b", opts.bundleID, opts.folder])
         }
         guard !opts.url.isEmpty else { return }
         // `open` returns before the window is actually in front, and a link
         // arriving too early finds no window to belong to — VS Code then opens
         // an empty one for it.
-        Thread.sleep(forTimeInterval: opts.folder.isEmpty ? 0 : 0.6)
+        Thread.sleep(forTimeInterval: 0.6)
         runOpen([opts.url])
     }
 

@@ -4,3 +4,4 @@ bin/
 *.vsix
 .vscode-test/
 .DS_Store
+.tmp/
