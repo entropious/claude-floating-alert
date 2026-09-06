@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2
+
+- A session in a nested folder raises the window closest around it. With the
+  same folder open in two windows — a sub-project, a worktree — the alert used
+  to pick whichever window listed it first.
+- `CFA_DEBUG=1` makes the hook report why it produced no alert.
+
 ## 1.1.1
 
 - A clicked alert opens the chat where the session was last worked in. A session
