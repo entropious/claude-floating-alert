@@ -57,8 +57,11 @@ settings, and trust the three entries — the extension reminds you once, right
 after it writes them.
 
 A Codex chat lives in a panel this extension cannot see into: nothing there says
-which session is on screen, so a focused window counts as a chat being watched,
-and a click opens the Codex panel rather than one particular chat.
+which session is on screen. What can be told is whether the Codex chat is on
+screen at all — a chat tab of its own, or the panel the side bar is currently
+set to — and that is what decides the alert; a chat behind a side bar you have
+closed entirely still counts as watched. A click opens the Codex panel rather
+than one particular chat.
 
 ## What it reads, and what leaves your machine
 

@@ -35,11 +35,28 @@ been granted. Codex takes a flag to run untrusted hooks anyway; it defeats the
 mechanism, and neither the extension nor the stand uses it.
 
 Everything below about deciding whether the chat is watched is about Claude Code
-alone. A Codex chat sits in a webview of another extension: nothing reports the
-session behind it, its tabs carry no label to match, and the panel's visibility
-is not something the API here can ask about. So a focused window is taken to
-mean the Codex chat is being watched, and there is no surface to reveal — only
-the panel.
+alone. A Codex chat sits in a webview of another extension, and nothing reports
+the session behind it, so `codexIsWatched` answers a coarser question — is the
+Codex chat on screen at all — from three things:
+
+1. **A chat tab.** Codex opens chats as editors too (`chatgpt.conversationEditor`
+   on the `openai-codex` scheme), and the tab API sees those exactly.
+2. **The chosen view container.** VS Code records which container each side bar
+   is set to in the layout state of the window (`state.vscdb`, next to the
+   extension storage `context.storageUri` points into), and writes it within a
+   second of a change. Another container means the Codex panel is not showing.
+3. **Window focus**, when neither of those is readable.
+
+What no source gives is whether the side bar is open: the entry keeps naming the
+last container while the bar is hidden, and `auxiliaryBar.hidden` is only written
+when the window closes. A chat behind a closed side bar therefore counts as
+watched. There is no API for this and no plan for one
+(microsoft/vscode#321409), and the alternative — putting a view of our own into
+the Codex container to watch its visibility — costs a permanent extra section in
+someone else's panel and goes silent the moment it is collapsed.
+
+There is also no surface to reveal on a click: `chatgpt.openSidebar` opens the
+panel on whatever chat it was left on.
 
 ## The one hard question
 

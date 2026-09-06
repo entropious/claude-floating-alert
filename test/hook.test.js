@@ -46,6 +46,18 @@ function makeHome(options) {
   );
   fs.chmodSync(path.join(root, "bin", "claude-alert"), 0o755);
 
+  // The layout state of the window, in the shape the hook reads it: one row per
+  // side bar, naming the view container it is set to.
+  let state = "";
+  if (options.container) {
+    state = path.join(SANDBOX, "state.vscdb");
+    const sql = [
+      "create table ItemTable (key text primary key, value blob);",
+      `insert into ItemTable values ('workbench.auxiliarybar.activepanelid', '${options.container}');`,
+    ].join("\n");
+    spawnSync("/usr/bin/sqlite3", [state], { input: sql, encoding: "utf-8" });
+  }
+
   // A live window, since the hook ignores windows whose process is gone.
   fs.writeFileSync(
     path.join(root, "focus", `${process.pid}.json`),
@@ -56,6 +68,8 @@ function makeHome(options) {
       folders: [CWD],
       chatTabs: options.chatTabs || [],
       activeChat: options.activeChat || "",
+      codexTab: options.codexTab || false,
+      state,
       at: new Date().toISOString(),
     })
   );
@@ -86,15 +100,21 @@ function runHook(kind, options, agent) {
   const args = agent ? [HOOK, kind, "--agent", agent] : [HOOK, kind];
   const result = spawnSync(process.execPath, args, {
     input: JSON.stringify({ session_id: SESSION, cwd: CWD, tool_name: "Bash" }),
-    env: { ...process.env, HOME: home, VSCODE_IPC_HOOK_CLI: "" },
+    // The debug line is what says an alert was decided against, which is the
+    // difference between "no alert" and "the alert has not started yet".
+    env: { ...process.env, HOME: home, VSCODE_IPC_HOOK_CLI: "", CFA_DEBUG: "1" },
     encoding: "utf-8",
   });
   assert.strictEqual(result.status, 0, "the hook must never fail the CLI");
+  if (result.stderr.trim()) return null;
 
-  // The alert is detached, so give it a moment to record itself.
-  for (let waited = 0; waited < 2000; waited += 25) {
+  // The alert is detached, so give it a moment to record itself. Spawning a
+  // process per tick would compete with the very thing being waited for, and on
+  // a busy machine the wait then expires before the alert gets to run.
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  for (let waited = 0; waited < 10000; waited += 25) {
     if (fs.existsSync(spawned)) return JSON.parse(fs.readFileSync(spawned, "utf-8"));
-    spawnSync(process.execPath, ["-e", "setTimeout(()=>{},25)"]);
+    Atomics.wait(wait, 0, 0, 25);
   }
   return null;
 }
@@ -221,9 +241,35 @@ test("alerts for Codex when the window is not focused", () => {
 });
 
 test("stays quiet for Codex while its window is focused", () => {
-  // The chat sits in a panel nothing here can see into, so a focused window is
-  // taken to mean the user is looking at it.
+  // With no layout state to read, a focused window has to stand for the chat.
   assert.strictEqual(runHook("stop", { focused: true }, "codex"), null);
+});
+
+test("stays quiet when the side bar is set to the Codex panel", () => {
+  const args = runHook(
+    "stop",
+    { focused: true, container: "workbench.view.extension.codexSecondaryViewContainer" },
+    "codex"
+  );
+  assert.strictEqual(args, null);
+});
+
+test("alerts when the side bar is set to another panel", () => {
+  const args = runHook(
+    "stop",
+    { focused: true, container: "workbench.view.extension.claude-sidebar-secondary" },
+    "codex"
+  );
+  assert.ok(args, "the Codex chat cannot be on screen while another panel is chosen");
+});
+
+test("stays quiet when a Codex chat is the tab on top", () => {
+  const args = runHook(
+    "stop",
+    { focused: true, codexTab: true, container: "workbench.view.extension.claude-sidebar-secondary" },
+    "codex"
+  );
+  assert.strictEqual(args, null, "a chat tab in front outranks whatever the side bar shows");
 });
 
 test("ignores the chat tabs of Claude Code when Codex fired", () => {

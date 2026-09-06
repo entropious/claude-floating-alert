@@ -229,8 +229,34 @@ function sessionHere() {
   return best.session;
 }
 
+/**
+ * Кто ответит на событие с папкой стенда. Папка стенда лежит внутри проекта, а
+ * значит рабочему окну она тоже подходит — и если в фокусе оно, проверка
+ * молча уходит не туда: отвечает окно с установленным расширением, а не то,
+ * что собрано из рабочего дерева.
+ */
+function windowForProbe() {
+  const cwd = workspace();
+  const suited = readAll(path.join(ROOT, "focus")).filter(
+    (state) =>
+      alive(state.pid) &&
+      (state.folders || []).some((folder) => cwd === folder || cwd.startsWith(folder + path.sep))
+  );
+  const focused = suited.find((state) => state.focused);
+  const stand = suited.find((state) => (state.folders || []).includes(cwd));
+  return { focused, stand, suited };
+}
+
 /** Событие в том виде, в каком его присылает агент. */
 function fire(kind, session, agent) {
+  const { focused, stand } = windowForProbe();
+  if (stand && focused && focused.pid !== stand.pid) {
+    console.error(
+      `событие перехватит чужое окно (pid ${focused.pid}: ${focused.folders.join(", ")}).\n` +
+        "перейдите в окно стенда — иначе проверяется установленное расширение, а не рабочее дерево"
+    );
+    process.exit(1);
+  }
   const payload = {
     session_id: session || (agent ? "" : sessionHere()) || "00000000-0000-4000-8000-000000000000",
     cwd: workspace(),

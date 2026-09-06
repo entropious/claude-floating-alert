@@ -6,6 +6,9 @@
   Codex is set up — next to whatever is already wired there, and the alert says
   which of the two agents is waiting. A click opens the Codex panel; the chat
   inside it is beyond reach, so a focused window counts as a chat being watched.
+- A Codex alert is skipped only while its chat is actually on screen — its own
+  editor tab, or the panel the side bar is set to — instead of any focused
+  window silencing it.
 - Codex runs a hook only once it is trusted, and skips an untrusted one without
   a word, so the wiring is followed by a notice saying where that is granted.
 - The per-kind switches are gone. The bell in the status bar turns every alert

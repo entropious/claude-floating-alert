@@ -355,10 +355,7 @@ function sessionIsWatched(cwd, sessionId, agent) {
   const window = focusedWindow(cwd);
   if (!window) return false;
 
-  // A Codex chat lives in a panel of the window, which no API here can see
-  // into: nothing names the session behind it and nothing says whether it is on
-  // screen. The focused window is all there is to go on.
-  if (agent === "codex") return true;
+  if (agent === "codex") return codexIsWatched(window);
 
   // A patched Claude Code names the session behind every surface, so the answer
   // is exact: this chat is in front of the user, or it is not.
@@ -374,6 +371,53 @@ function sessionIsWatched(cwd, sessionId, agent) {
   // Otherwise the chat lives in the side bar, which the tab API cannot see —
   // the focused window is the best signal there is.
   return true;
+}
+
+/** The view containers Codex puts its panel in, as the layout state names them. */
+const CODEX_CONTAINERS = [
+  "workbench.view.extension.codexSecondaryViewContainer",
+  "workbench.view.extension.codexViewContainer",
+];
+
+/**
+ * Which view container each side bar of a window is set to, read out of the
+ * layout state VS Code keeps for that window. No API tells an extension what
+ * another extension's panel is doing; this is the one thing recorded about it,
+ * and it is written within a second of the user switching panels.
+ *
+ * What it does not record is whether the side bar is open at all: the entry
+ * keeps naming the last container through a hidden side bar. So a match means
+ * "the panel would be showing", not "it is on screen".
+ */
+function chosenContainers(state) {
+  if (!state) return [];
+  try {
+    const out = require("child_process").execFileSync(
+      "/usr/bin/sqlite3",
+      [
+        "-readonly",
+        state,
+        "select value from ItemTable where key in ('workbench.auxiliarybar.activepanelid','workbench.sidebar.activeviewletid')",
+      ],
+      { encoding: "utf-8", timeout: 2000 }
+    );
+    return out.split("\n").map((line) => line.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * True when the Codex chat is in front of the user. A chat opened as an editor
+ * tab answers exactly — the tab API sees it. For the panel the answer is the
+ * container the side bars are set to, and with nothing readable at all the
+ * focused window has to stand for the chat, as it does for a Claude side bar.
+ */
+function codexIsWatched(window) {
+  if (window.codexTab) return true;
+  const chosen = chosenContainers(window.state);
+  if (chosen.length === 0) return true;
+  return chosen.some((container) => CODEX_CONTAINERS.includes(container));
 }
 
 function compose(kind, input, agent) {

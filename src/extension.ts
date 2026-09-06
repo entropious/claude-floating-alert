@@ -42,6 +42,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(statusItem);
   refreshStatus();
 
+  findStateDatabase(context);
   publishFocus(vscode.window.state.focused);
   if (vscode.window.state.focused) dismissOwnPanels();
 
@@ -82,6 +83,27 @@ function isChatTab(tab: vscode.Tab): boolean {
   return typeof input?.viewType === "string" && input.viewType.includes(CHAT_VIEW_TYPE);
 }
 
+/** A Codex chat opened as an editor: its own custom editor, on its own scheme. */
+const CODEX_EDITOR = "chatgpt.conversationEditor";
+const CODEX_SCHEME = "openai-codex";
+
+function isCodexTab(tab: vscode.Tab): boolean {
+  const input = tab.input as { viewType?: string; uri?: vscode.Uri } | undefined;
+  if (typeof input?.viewType === "string" && input.viewType.includes(CODEX_EDITOR)) return true;
+  return input?.uri?.scheme === CODEX_SCHEME;
+}
+
+/** Whether a Codex chat is the tab on top — the one case where its chat is
+ *  visible to an API outside Codex itself. */
+function codexTabActive(): boolean {
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      if (isCodexTab(tab) && tab.isActive && group.isActive) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Titles of the chat tabs in this window, and the one on top (empty when the
  * user is looking at something else). Chat tabs are labelled after the session,
@@ -101,6 +123,21 @@ function chatTabs(): { titles: string[]; active: string } {
   return { titles, active };
 }
 
+/**
+ * Where VS Code keeps the layout state of this window, `state.vscdb` next to the
+ * storage directory of every extension in the workspace. It holds the one thing
+ * about a panel of another extension that is knowable — which view container the
+ * side bars are set to — and it is written within a second of a change.
+ */
+let stateDatabase = "";
+
+function findStateDatabase(context: vscode.ExtensionContext): void {
+  const own = context.storageUri?.fsPath;
+  if (!own) return;
+  const file = path.join(path.dirname(own), "state.vscdb");
+  if (fs.existsSync(file)) stateDatabase = file;
+}
+
 /** Tell the hook script whether this window — not just VS Code — is focused. */
 function publishFocus(focused: boolean): void {
   const chats = chatTabs();
@@ -115,6 +152,8 @@ function publishFocus(focused: boolean): void {
         folders: workspacePaths(),
         chatTabs: chats.titles,
         activeChat: chats.active,
+        codexTab: codexTabActive(),
+        state: stateDatabase,
         at: new Date().toISOString(),
       })
     );
