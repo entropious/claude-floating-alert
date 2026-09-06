@@ -305,13 +305,17 @@ function windowFolder(cwd, sessionId) {
     const folder = state && (state.folders || []).find((candidate) => isInside(cwd, candidate));
     if (folder) return folder;
   }
+  // Nested folders can each be open in a window of their own — a sub-project, a
+  // worktree — so the closest folder around the session is the right window.
+  let closest = "";
   for (const state of windowsFor(cwd)) {
-    const folder = (state.folders || []).find((candidate) => isInside(cwd, candidate));
-    if (folder) return folder;
+    for (const folder of state.folders || []) {
+      if (isInside(cwd, folder) && folder.length > closest.length) closest = folder;
+    }
   }
   // With no window to raise the answer is empty: a folder no window has open
   // would open a new one.
-  return "";
+  return closest;
 }
 
 /**
@@ -377,20 +381,28 @@ function compose(kind, input) {
   }
 }
 
+/** Why an event produced no panel — silence is the normal case, and the reasons
+ *  for it are spread across windows, surfaces and panels of other events. */
+function explain(reason) {
+  if (process.env.CFA_DEBUG) process.stderr.write(`claude-floating-alert: ${reason}\n`);
+}
+
 function main(kind, input) {
   const cwd = input.cwd || "";
   const session = input.session_id;
 
   // An unknown kind means a stale hook entry from an older install.
   const config = readConfig()[kind];
-  if (!config || !config.enabled) return;
-  if (!fs.existsSync(BINARY)) return;
+  if (!config || !config.enabled) return explain(`kind ${kind} is off`);
+  if (!fs.existsSync(BINARY)) return explain("no alert binary installed");
 
-  if (sessionIsWatched(cwd, session)) return;
+  if (sessionIsWatched(cwd, session)) return explain("the chat is in front of the user");
 
   // A self-closing panel must not replace one that waits for an answer.
   const previous = livePanel(session);
-  if (previous && BLOCKING.has(previous.kind) && !BLOCKING.has(kind)) return;
+  if (previous && BLOCKING.has(previous.kind) && !BLOCKING.has(kind)) {
+    return explain(`a ${previous.kind} alert is still waiting for an answer`);
+  }
 
   const { subtitle, title, body } = compose(kind, input);
   // The folder raises the window that has it open; the link then tells that

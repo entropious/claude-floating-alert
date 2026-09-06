@@ -1,6 +1,7 @@
 .vscode/**
 .claude/**
 .tmp/**
+.probe/**
 node_modules/**
 src/**
 native/**
@@ -11,4 +12,5 @@ tsconfig.json
 tsconfig.tsbuildinfo
 package-lock.json
 .gitignore
+CLAUDE.md
 *.vsix

@@ -5,3 +5,8 @@ bin/
 .vscode-test/
 .DS_Store
 .tmp/
+# The debug stand is worth keeping; what it produces — an editor profile, copies
+# of extensions, screenshots, logs — is not.
+.probe/*
+!.probe/devhost.sh
+!.probe/devhost-check.js
