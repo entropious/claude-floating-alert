@@ -10,6 +10,9 @@
 //   fire <kind> [session] [agent]
 //                          прогнать хук так, будто событие пришло от агента
 //   codex                  запускает ли Codex наши хуки, и мешает ли доверие
+//   containers             какой контейнер выбран в боковых панелях окна стенда
+//   expect alert|silence [строка]
+//                          вердикт сценария: висит ли алерт и то ли в нём
 //   shot [файл]            снимок окна средствами самого редактора
 
 const fs = require("fs");
@@ -199,11 +202,85 @@ function focus() {
   }
 }
 
-function alerts() {
+function alertLines() {
   const out = spawnSync("pgrep", ["-fl", "claude-alert"], { encoding: "utf-8" }).stdout || "";
-  const lines = out.split("\n").filter((line) => line.includes("--title"));
+  return out.split("\n").filter((line) => line.includes("--title"));
+}
+
+function alerts() {
+  const lines = alertLines();
   if (!lines.length) return console.log("алертов на экране нет");
   for (const line of lines) console.log(line);
+}
+
+function pause(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Вердикт сценария: сам сценарий говорит, сошлось или нет, и уходит с кодом
+ * возврата — иначе результат приходится сверять глазами по строчке «ожидание».
+ *
+ * Алерт — отдельный процесс, и появляется он не мгновенно; ожидания «алерта
+ * нет» это тоже касается, поэтому ждут обе стороны, просто ответ на «нет»
+ * известен только по истечении срока.
+ */
+function expect(want, contains, seconds = 2) {
+  // Алерт живёт своей жизнью: у события «задача готова» он гаснет через
+  // несколько секунд, и к моменту проверки на экране его уже нет. След
+  // остаётся в run/ — по нему и видно, что алерт был.
+  const since = Date.now() - 2000;
+  const traces = () => {
+    try {
+      return fs
+        .readdirSync(RUN_DIR)
+        .map((name) => path.join(RUN_DIR, name))
+        .filter((file) => fs.statSync(file).mtimeMs >= since);
+    } catch {
+      return [];
+    }
+  };
+  let lines = [];
+  let left = [];
+  for (let waited = 0; waited < seconds * 1000; waited += 50) {
+    lines = alertLines();
+    left = traces();
+    if (lines.length || left.length) break;
+    pause(50);
+  }
+  const shown = lines.length > 0 || left.length > 0;
+  const matched =
+    !contains ||
+    lines.some((line) => line.includes(contains)) ||
+    left.some((file) => fs.readFileSync(file, "utf-8").includes(contains.replace("agent=", "")));
+  const good = want === "alert" ? shown && matched : !shown;
+  console.log(good ? `  ok  ${want === "alert" ? "алерт" : "тишина"}` : `FAIL  ждали: ${want}${contains ? ` (${contains})` : ""}`);
+  if (!good) {
+    for (const line of lines) console.log(`      ${line}`);
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * Какой контейнер выбран в боковых панелях окна стенда — то самое, по чему хук
+ * судит о чате Codex. Читается из состояния окна, путь к которому окно само и
+ * публикует.
+ */
+function containers() {
+  const state = (readAll(path.join(ROOT, "focus")).find(
+    (window) => alive(window.pid) && (window.folders || []).includes(workspace())
+  ) || {}).state;
+  if (!state) return console.log("окно стенда не публикует состояние");
+  const out = spawnSync(
+    "/usr/bin/sqlite3",
+    [
+      "-readonly",
+      state,
+      "select key || ' = ' || value from ItemTable where key in ('workbench.auxiliarybar.activepanelid','workbench.sidebar.activeviewletid')",
+    ],
+    { encoding: "utf-8" }
+  ).stdout;
+  console.log((out || "").trim() || "панели ещё не переключали — в состоянии пусто");
 }
 
 /** Папка события: у отладочного окна она своя, чтобы рабочее окно с той же
@@ -284,12 +361,366 @@ function fire(kind, session, agent) {
  * Прогон идёт в каталоге, который не открыт ни в одном окне: иначе алерт
  * подавится тем, что окно в фокусе, и молчание будет означать совсем другое.
  */
-function codexTrust() {
-  const codex = fs
+/**
+ * Прописать скопированные расширения в реестр отладочного профиля. Редактор
+ * держит список установленного в extensions.json и папку, которой там нет,
+ * при следующем запуске сносит — Claude Code однажды прописался сам, Codex
+ * так и исчезал между прогонами.
+ *
+ * Записи берутся из обычного профиля, где эти расширения установлены по-
+ * настоящему, и отличаются только путём.
+ */
+function register(dir) {
+  const source = path.join(os.homedir(), ".vscode", "extensions", "extensions.json");
+  let installed = [];
+  try {
+    installed = JSON.parse(fs.readFileSync(source, "utf-8"));
+  } catch {
+    console.error(`не читается ${source}`);
+    process.exit(1);
+  }
+  const copied = fs.readdirSync(dir).filter((name) => fs.statSync(path.join(dir, name)).isDirectory());
+  const entries = [];
+  for (const name of copied) {
+    const entry = installed.find((item) => item.relativeLocation === name);
+    if (!entry) {
+      console.log(`  пропущено: ${name} — в обычном профиле такого нет`);
+      continue;
+    }
+    entries.push({
+      ...entry,
+      location: { ...entry.location, path: path.join(dir, name) },
+      relativeLocation: name,
+    });
+  }
+  fs.writeFileSync(path.join(dir, "extensions.json"), JSON.stringify(entries, null, 2));
+  console.log(`в реестре профиля: ${entries.map((e) => e.identifier.id).join(", ") || "пусто"}`);
+}
+
+/**
+ * Выдать окно стенда за активное, не забирая фокус у того, кто работает.
+ *
+ * Подделывается ровно то, по чему судит хук, — строчка focused в файле окна.
+ * Настоящий фокус подделать нечем: редактор узнаёт о нём от системы, а не из
+ * страницы, и эмуляция фокуса через CDP держится до первой же сверки. Забирать
+ * же фокус по-настоящему значит мешать работе при каждом прогоне.
+ *
+ * Расширение переписывает этот файл на своих событиях — смене фокуса, вкладок,
+ * папок. Переключение панелей ни одного из них не вызывает, так что подделка
+ * живёт ровно столько, сколько нужно сценарию.
+ */
+function pretend(active) {
+  const focused = active !== "off";
+  const file = fs
+    .readdirSync(path.join(ROOT, "focus"))
+    .map((name) => path.join(ROOT, "focus", name))
+    .find((candidate) => {
+      try {
+        const state = JSON.parse(fs.readFileSync(candidate, "utf-8"));
+        return alive(state.pid) && (state.folders || []).includes(workspace());
+      } catch {
+        return false;
+      }
+    });
+  if (!file) {
+    console.error("окно стенда не найдено: bash .probe/devhost.sh start");
+    process.exit(1);
+  }
+  const state = JSON.parse(fs.readFileSync(file, "utf-8"));
+  fs.writeFileSync(file, JSON.stringify({ ...state, focused }));
+  console.log(`окно стенда числится ${focused ? "активным" : "фоновым"}`);
+}
+
+/**
+ * Написать в чат Claude Code, открытый в окне стенда. Отсюда берётся то, чего
+ * подделкой не получить: настоящая сессия, которую чат заводит только на первом
+ * сообщении, и настоящий Stop-хук в конце ответа.
+ *
+ * Поле ввода — обычный textarea внутри вебвью чата; текст вставляется в него
+ * напрямую, потому что клавиатурный ввод ушёл бы в то окно, что сейчас в
+ * фокусе, а стенд намеренно работает в фоне.
+ */
+/** Вебвью нужного расширения: у каждой панели свой CDP-таргет, и адрес его
+ *  фрейма называет расширение, которому она принадлежит. */
+const PANELS = { claude: "extensionId=Anthropic.claude-code", codex: "extensionId=openai.chatgpt" };
+
+async function ask(text, who = "claude") {
+  // Поле находит и фокусирует скрипт, а печатает CDP: редактор чата слушает
+  // настоящий ввод, и подставленное из скрипта значение он не замечает.
+  const focus = `(() => {
+    ${DOCS};
+    for (const doc of docs()) {
+      // Поле чата — не textarea: это div с contenteditable="plaintext-only",
+      // так что искать по contenteditable="true" бесполезно.
+      const field = doc.querySelector("textarea, [role=textbox], [contenteditable]");
+      if (!field) continue;
+      field.focus();
+      // В поле мог остаться прошлый текст — тогда к нему допишется новый.
+      doc.getSelection().selectAllChildren(field);
+      return field.tagName;
+    }
+    return "";
+  })()`;
+  const mark = PANELS[who];
+  if (!mark) {
+    console.error(`не знаю панель ${who}: claude | codex`);
+    process.exit(1);
+  }
+  for (const target of await targets()) {
+    const url = target.url || "";
+    if (!url.startsWith("vscode-webview://") || !url.includes(mark)) continue;
+    const found = await evaluate(target.webSocketDebuggerUrl, focus);
+    if (!found) continue;
+    await send(target.webSocketDebuggerUrl, [
+      { method: "Input.insertText", params: { text } },
+      ...key("\r", "Enter", 13, 0),
+    ]);
+    return console.log(`отправлено в панель ${who} (${found}): ${text}`);
+  }
+  console.error(`панель ${who} не нашлась — открыта ли она в окне стенда?`);
+  process.exit(1);
+}
+
+/**
+ * Дождаться ответа в транскрипте сессии. Без этого проверка «алерта нет»
+ * сошлась бы и тогда, когда событие вовсе не приходило: тишина одинаково
+ * выглядит и при верном решении хука, и при несостоявшемся ответе.
+ */
+function waitAnswer(session, seconds) {
+  const file = path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    workspace().replace(/[/.]/g, "-"),
+    `${session}.jsonl`
+  );
+  for (let waited = 0; waited < seconds * 1000; waited += 500) {
+    try {
+      const lines = fs.readFileSync(file, "utf-8").split("\n");
+      if (lines.some((line) => line.includes('"type":"assistant"'))) {
+        return console.log("ответ получен, значит Stop уже был");
+      }
+    } catch {}
+    pause(500);
+  }
+  console.error(`за ${seconds} c ответа в транскрипте не появилось: ${file}`);
+  process.exit(1);
+}
+
+/**
+ * Сессия чата нужного вида — и только в окне стенда: чаты рабочего окна тоже
+ * попадают в отчёты, и взятая оттуда сессия увела бы проверку в чужое окно.
+ */
+function sessionOf(kind) {
+  for (const state of readAll(path.join(ROOT, "presence"))) {
+    if (!alive(state.pid)) continue;
+    if (!(state.folders || []).includes(workspace())) continue;
+    const found = (state.surfaces || []).find(
+      (surface) => surface.kind === kind && surface.chat !== false && surface.session
+    );
+    if (found) return found.session;
+  }
+  return "";
+}
+
+/**
+ * Дождаться ответа Codex — то есть того, после чего только и может прийти его
+ * Stop-хук. Без этого ожиданием алерта пришлось бы накрывать и разговор с
+ * моделью, и холодный старт его сервера, а по такому сроку уже не понять, что
+ * именно не сработало.
+ */
+function waitCodex(seconds) {
+  const probe = workspace();
+  const sessions = path.join(os.homedir(), ".codex", "sessions");
+  // Только то, что писалось сейчас: разговоры прошлых прогонов лежат там же и
+  // ответили бы за этот, а проверка ушла бы ждать алерт, которого ещё нет.
+  const since = Date.now() - 5000;
+  const answered = () => {
+    const walk = (dir) => {
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return false;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory() && walk(full)) return true;
+        if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+        let text = "";
+        try {
+          if (fs.statSync(full).mtimeMs < since) continue;
+          text = fs.readFileSync(full, "utf-8");
+        } catch {
+          continue;
+        }
+        if (text.includes(`"cwd":"${probe}"`) && text.includes('"role":"assistant"')) return true;
+      }
+      return false;
+    };
+    return walk(sessions);
+  };
+  for (let waited = 0; waited < seconds * 1000; waited += 500) {
+    if (answered()) return console.log("Codex ответил, дальше его Stop");
+    pause(500);
+  }
+  console.error(`за ${seconds} c Codex не ответил`);
+  process.exit(1);
+}
+
+/** Дождаться, пока чат заведёт сессию: до первого сообщения её просто нет. */
+function waitSession(kind, seconds) {
+  for (let waited = 0; waited < seconds * 1000; waited += 500) {
+    const session = sessionOf(kind);
+    if (session) return console.log(session);
+    pause(500);
+  }
+  console.error(`за ${seconds} c чат стенда так и не завёл сессию вида ${kind}`);
+  process.exit(1);
+}
+
+/**
+ * Перенести в профиль стенда то, что расширения помнят про пользователя между
+ * запусками: Codex в свежем профиле встречает онбордингом, а его не пройти ни
+ * кликом, ни командой — чата за ним просто нет.
+ *
+ * Переносится только состояние самих расширений, вход остаётся общим: он лежит
+ * в ~/.codex и ~/.claude, куда смотрят обе копии.
+ */
+function seed(profile) {
+  const source = path.join(
+    os.homedir(),
+    "Library",
+    "Application Support",
+    "Code",
+    "User",
+    "globalStorage",
+    "state.vscdb"
+  );
+  const target = path.join(profile, "User", "globalStorage", "state.vscdb");
+  if (!fs.existsSync(source)) return console.log("обычного профиля нет — переносить нечего");
+  if (!fs.existsSync(target)) return console.log("профиль стенда ещё не создан: bash .probe/devhost.sh start");
+
+  const keys = ["openai.chatgpt", "Anthropic.claude-code"];
+  let moved = [];
+  for (const key of keys) {
+    const value = spawnSync("/usr/bin/sqlite3", ["-readonly", source, `select value from ItemTable where key='${key}'`], {
+      encoding: "utf-8",
+    }).stdout.trim();
+    if (!value) continue;
+    const write = spawnSync("/usr/bin/sqlite3", [target], {
+      input: `insert or replace into ItemTable (key, value) values ('${key}', '${value.replace(/'/g, "''")}');`,
+      encoding: "utf-8",
+    });
+    if (write.status === 0) moved.push(key);
+  }
+  console.log(`перенесено в профиль стенда: ${moved.join(", ") || "ничего"}`);
+}
+
+/**
+ * Убрать чаты, которые живые прогоны наплодили в обоих агентах. Свои сессии
+ * они пишут туда же, куда пишут пользовательские, и история обрастает
+ * повторами «ответь одним словом: ok».
+ *
+ * Отбор строго по рабочей папке стенда: всё, что заведено из другого места, —
+ * чужое, и его не трогают.
+ */
+function clean() {
+  const probe = workspace();
+  let removed = 0;
+
+  const projects = path.join(os.homedir(), ".claude", "projects", probe.replace(/[/.]/g, "-"));
+  if (fs.existsSync(projects)) {
+    fs.rmSync(projects, { recursive: true, force: true });
+    removed += 1;
+  }
+
+  // Codex держит чаты и файлом, и строкой в своей базе: панель читает базу, так
+  // что без неё удалённые чаты остались бы в списке.
+  const sessions = path.join(os.homedir(), ".codex", "sessions");
+  const walk = (dir) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".jsonl")) {
+        try {
+          // Не только сама папка стенда: проверка доверия работает во временном
+          // подкаталоге внутри неё, и её сессии тоже наши.
+          if (/"cwd":"([^"]*)"/.test(fs.readFileSync(full, "utf-8").slice(0, 4096)) && RegExp.$1.startsWith(probe)) {
+            fs.rmSync(full);
+            removed += 1;
+          }
+        } catch {}
+      }
+    }
+  };
+  walk(sessions);
+
+  const db = path.join(os.homedir(), ".codex", "state_5.sqlite");
+  if (fs.existsSync(db)) {
+    spawnSync("/usr/bin/sqlite3", [db], {
+      input: `delete from threads where cwd like '${probe.replace(/'/g, "''")}%';`,
+      encoding: "utf-8",
+    });
+  }
+  console.log(`убрано чатов стенда: ${removed}`);
+}
+
+function codexBinary() {
+  return fs
     .readdirSync(path.join(os.homedir(), ".vscode", "extensions"))
     .filter((name) => name.startsWith("openai.chatgpt-"))
     .map((name) => path.join(os.homedir(), ".vscode", "extensions", name, "bin", "macos-aarch64", "codex"))
     .find((file) => fs.existsSync(file));
+}
+
+/**
+ * Настоящее событие от Codex в папке стенда: хук дёргает сам Codex своим Stop,
+ * а не стенд подделкой. Подделка проверила бы только разбор аргументов — а
+ * вопрос в том, доходит ли до нас событие живого агента и что решает хук.
+ *
+ * Один короткий обмен с моделью на прогон; это цена того, что проверяется
+ * настоящая цепочка.
+ */
+function codexRun() {
+  const codex = codexBinary();
+  if (!codex) {
+    console.error("Codex не установлен");
+    process.exit(1);
+  }
+  // Та же ловушка, что и у подделки: папка стенда лежит внутри проекта, и на
+  // событие ответит рабочее окно, если в фокусе оно.
+  const { focused, stand } = windowForProbe();
+  if (stand && focused && focused.pid !== stand.pid) {
+    console.error(`событие перехватит чужое окно (pid ${focused.pid}: ${focused.folders.join(", ")})`);
+    process.exit(1);
+  }
+  const result = spawnSync(codex, ["exec", "--skip-git-repo-check", "reply with the single word ok"], {
+    cwd: workspace(),
+    encoding: "utf-8",
+  });
+  const out = `${result.stdout || ""}${result.stderr || ""}`;
+  if (result.status !== 0) {
+    console.error(`Codex не отработал:\n${out.trim().split("\n").slice(-5).join("\n")}`);
+    process.exit(1);
+  }
+  // Хуков в выводе нет, когда Codex им не доверяет — молчание алерта тогда
+  // означало бы совсем не то, что проверяет сценарий.
+  if (!/hook: Stop/.test(out)) {
+    console.error("Codex не запустил ни одного хука — доверие: bash .probe/devhost.sh codex");
+    process.exit(1);
+  }
+  console.log("Codex отработал, его Stop-хук выполнен");
+}
+
+function codexTrust() {
+  const codex = codexBinary();
   if (!codex) return console.log("Codex не установлен — проверять нечего");
 
   const hooksFile = path.join(os.homedir(), ".codex", "hooks.json");
@@ -312,7 +743,9 @@ function codexTrust() {
   } catch {}
   console.log(`доверие в config.toml:        ${trusted ? "есть" : "нет ни одного"}`);
 
-  const cwd = fs.mkdtempSync(path.join(ROOT, "probe-codex-"));
+  // В папке стенда: репозиторий отпадает — его окно бывает в фокусе, и алерт
+  // подавился бы; ~/.claude отпадает тоже — там боевые файлы расширения.
+  const cwd = fs.mkdtempSync(path.join(workspace(), "probe-codex-"));
   let ran = null;
   try {
     const before = new Set(fs.readdirSync(RUN_DIR));
@@ -444,14 +877,9 @@ async function main() {
     case "session": {
       // Сессия поверхности нужного вида — чтобы событие адресовать именно ей.
       const kind = rest[0] || "tab";
-      for (const state of readAll(path.join(ROOT, "presence"))) {
-        if (!alive(state.pid)) continue;
-        const found = (state.surfaces || []).find(
-          (surface) => surface.kind === kind && surface.chat !== false && surface.session
-        );
-        if (found) return console.log(found.session);
-      }
-      console.error(`нет поверхности вида ${kind}`);
+      const session = sessionOf(kind);
+      if (session) return console.log(session);
+      console.error(`в окне стенда нет поверхности вида ${kind}`);
       process.exit(1);
       break;
     }
@@ -467,8 +895,43 @@ async function main() {
     case "codex":
       codexTrust();
       break;
+    case "codexrun":
+      codexRun();
+      break;
+    case "register":
+      register(rest[0] || path.join(__dirname, "vscode-ext"));
+      break;
+    case "seed":
+      seed(rest[0] || path.join(__dirname, "vscode-user"));
+      break;
+    case "clean":
+      clean();
+      break;
+    case "pretend":
+      pretend(rest[0] || "on");
+      break;
+    case "ask":
+      await ask(rest.slice(1).join(" ") || "ответь одним словом: ok", rest[0] || "claude");
+      break;
+    case "wait-session":
+      waitSession(rest[0] || "sidebar", Number(rest[1]) || 10);
+      break;
+    case "wait-answer":
+      waitAnswer(rest[0], Number(rest[1]) || 20);
+      break;
+    case "wait-codex":
+      waitCodex(Number(rest[0]) || 30);
+      break;
+    case "containers":
+      containers();
+      break;
+    case "expect":
+      expect(rest[0] || "alert", rest[1], Number(rest[2]) || 2);
+      break;
     default:
-      console.error("команды: targets | command | eval | surfaces | focus | alerts | fire | codex");
+      console.error(
+        "команды: targets | command | eval | surfaces | focus | alerts | fire | codex | containers | expect"
+      );
       process.exit(1);
   }
 }

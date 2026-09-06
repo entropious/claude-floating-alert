@@ -23,7 +23,10 @@
 #   bash .probe/devhost.sh case watched     сценарий: чат перед глазами → алерта быть не должно
 #
 #   bash .probe/devhost.sh codex            запускает ли Codex наши хуки (доверие)
-#   bash .probe/devhost.sh case codex       сценарий: событие Codex → ждём алерт со ссылкой на панель
+#   bash .probe/devhost.sh containers       какая панель выбрана в окне стенда
+#   bash .probe/devhost.sh case codex       сценарий: панель Codex решает судьбу алерта
+#   bash .probe/devhost.sh case live-codex  сценарий: событие присылает сам Codex
+#   bash .probe/devhost.sh case live-claude сценарий: событие присылает сам Claude Code
 #
 # Окно запускается один раз и само себя не перезапускает: пересборка
 # подхватывается только явным restart.
@@ -34,9 +37,11 @@ CODE="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
 PROFILE="$ROOT/.probe/vscode-user"
 EXTENSIONS="$ROOT/.probe/vscode-ext"
 export CDP_PORT="${CDP_PORT:-9333}"
-# Своя папка: событие приписывается тому окну, где эта папка открыта, и с общим
-# корнем проверку перехватывало бы рабочее окно, а не отладочное.
-export PROBE_CWD="$ROOT/.probe/workspace"
+# Своя папка, и намеренно вне репозитория: событие достаётся окну, у которого
+# открыта папка выше по дереву, — лежи она в .probe, на событие отвечало бы и
+# рабочее окно, открытое на корне проекта. В ~/.claude её тоже не место: там
+# живут боевые файлы расширения, и стенд к ним ничего не добавляет.
+export PROBE_CWD="$(dirname "$ROOT")/.claude-floating-alert-probe"
 ARGS=(--user-data-dir="$PROFILE" --extensions-dir="$EXTENSIONS")
 CHECK=(node "$ROOT/.probe/devhost-check.js")
 
@@ -52,7 +57,9 @@ case "${1:-}" in
 deps)
 	mkdir -p "$EXTENSIONS"
 	# Claude Code берётся уже установленный — вместе с патчем, который в нём есть.
-	for dir in "$HOME"/.vscode/extensions/anthropic.claude-code-*; do
+	# Codex нужен не работающим, а зарегистрированным: сценарию хватает того,
+	# что редактор знает его контейнер и пишет его id в состояние окна.
+	for dir in "$HOME"/.vscode/extensions/anthropic.claude-code-* "$HOME"/.vscode/extensions/openai.chatgpt-*; do
 		[ -d "$dir" ] || continue
 		target="$EXTENSIONS/$(basename "$dir")"
 		# Именно перезапись: патч в установленном Claude Code меняется, а копия
@@ -61,6 +68,8 @@ deps)
 		cp -R "$dir" "$target"
 		echo "положено: $(basename "$dir")"
 	done
+	"${CHECK[@]}" register "$EXTENSIONS"
+	"${CHECK[@]}" seed "$PROFILE"
 	echo "готово; своё расширение окно берёт из рабочего дерева, ставить его не нужно"
 	;;
 
@@ -104,6 +113,9 @@ stop)
 	for _ in $(seq 1 15); do cdp_up || break; sleep 1; done
 	for pid in $(host_pids); do kill -9 "$pid" 2>/dev/null; done
 	kill_alerts
+	# Чаты живых прогонов оба агента пишут туда же, куда пользовательские.
+	# Убираются они последними: пока окно живо, оно заводит их заново.
+	"${CHECK[@]}" clean
 	echo "окно закрыто"
 	;;
 
@@ -111,7 +123,7 @@ restart)
 	bash "$0" stop; bash "$0" start
 	;;
 
-surfaces|focus|alerts|targets|shot|front|codex)
+surfaces|focus|alerts|targets|shot|front|codex|containers|pretend)
 	"${CHECK[@]}" "$@"
 	;;
 
@@ -148,6 +160,9 @@ tab)      "${CHECK[@]}" bar "Claude Code" > /dev/null; sleep 1
 sessions) "${CHECK[@]}" bar "Claude Code" ;;
 hide)     "${CHECK[@]}" command "View: Toggle Secondary Side Bar Visibility" ;;
 explorer) "${CHECK[@]}" command "View: Show Explorer" ;;
+# Логин Codex стенду не нужен: панель открывается и без него, а сценарию важно
+# только то, какой контейнер после этого числится выбранным.
+codexbar) "${CHECK[@]}" command "Codex: Open Codex Sidebar" ;;
 
 fire)
 	kill_alerts
@@ -163,16 +178,22 @@ case)
 	case "${2:-}" in
 	hidden)
 		echo "== чат в боковой панели, панель скрыта"
-		bash "$0" raise || exit 1
 		bash "$0" sidebar > /dev/null; sleep 2
+		# Сессию чат заводит только на первом сообщении, а без неё событие
+		# некому приписать: отчёты чата такой сессии не знают, и любая проверка
+		# выродилась бы в «алерт на выдуманный id».
+		"${CHECK[@]}" ask "ответь одним словом: ok"
+		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
 		bash "$0" hide > /dev/null; sleep 2
 		"${CHECK[@]}" surfaces
-		bash "$0" fire stop
-		echo "ожидание: алерт есть"
+		# Фокус подделывается последним: расширение переписывает файл окна на
+		# смене вкладок и папок, и подделка до этих шагов не дожила бы.
+		"${CHECK[@]}" pretend on
+		bash "$0" fire stop "$session" > /dev/null
+		"${CHECK[@]}" expect alert || exit 1
 		;;
 	tab)
 		echo "== чат вкладкой, поверх него другая вкладка"
-		bash "$0" raise || exit 1
 		bash "$0" tab > /dev/null; sleep 4
 		session=$("${CHECK[@]}" session tab) || { echo "вкладка чата не открылась"; exit 1; }
 		"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 2
@@ -180,32 +201,97 @@ case)
 		# а он должен уйти за вкладку, иначе проверять нечего.
 		"${CHECK[@]}" command "View: Join All Editor Groups" > /dev/null; sleep 2
 		"${CHECK[@]}" surfaces
-		bash "$0" fire stop "$session"
-		echo "ожидание: алерт есть"
+		"${CHECK[@]}" pretend on
+		bash "$0" fire stop "$session" > /dev/null
+		"${CHECK[@]}" expect alert || exit 1
 		;;
 	watched)
 		echo "== чат перед глазами"
-		bash "$0" raise || exit 1
 		bash "$0" sidebar > /dev/null; sleep 2
+		"${CHECK[@]}" ask "ответь одним словом: ok"
+		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
 		"${CHECK[@]}" surfaces
-		bash "$0" fire stop
-		echo "ожидание: алерта нет"
+		"${CHECK[@]}" pretend on
+		bash "$0" fire stop "$session" > /dev/null
+		"${CHECK[@]}" expect silence || exit 1
 		;;
 	codex)
-		echo "== событие Codex: панель видна только ему, решает фокус окна"
-		bash "$0" raise || exit 1
-		echo "-- окно в фокусе"
-		bash "$0" fire stop "" codex
-		echo "ожидание: алерта нет"
-		# Фокус уводится на Finder: чат Codex ничем не отличим от любого другого
-		# содержимого окна, и единственный признак — что окна нет перед глазами.
-		open -a Finder; sleep 2
-		echo "-- фокус уведён на Finder"
-		bash "$0" fire permission "" codex
-		echo "ожидание: алерт есть, в ссылке agent=codex"
+		# Что решает судьбу алерта Codex: панель, выбранная в боковой полосе.
+		# Сам чат Codex ни о чём не сообщает, поэтому сценарий переключает
+		# контейнеры и смотрит, совпадает ли молчание с тем, что выбран Codex.
+		echo "== событие Codex"
+		# Фокус не забирается: окно числится активным по своему файлу, а панели
+		# переключаются через CDP. Прогон не мешает тому, кто работает рядом.
+		"${CHECK[@]}" pretend on
+
+		bash "$0" codexbar > /dev/null; sleep 3
+		echo "-- открыта панель Codex"
+		chosen=$("${CHECK[@]}" containers)
+		echo "$chosen"
+		case "$chosen" in
+		*codex*) ;;
+		*)
+			echo "панель Codex не открылась — есть ли он в профиле? bash .probe/devhost.sh deps"
+			exit 1
+			;;
+		esac
+		bash "$0" fire stop "" codex > /dev/null
+		"${CHECK[@]}" expect silence || exit 1
+
+		bash "$0" sidebar > /dev/null; sleep 3
+		echo "-- та же полоса переключена на чат Claude Code"
+		"${CHECK[@]}" containers
+		bash "$0" fire stop "" codex > /dev/null
+		"${CHECK[@]}" expect alert "agent=codex" || exit 1
+
+		bash "$0" codexbar > /dev/null; sleep 3
+		# Панель Codex снова выбрана: значит следующая проверка показывает именно
+		# потерю окна, а не панель.
+		echo "-- панель Codex выбрана, но окна нет перед глазами"
+		"${CHECK[@]}" pretend off
+		bash "$0" fire permission "" codex > /dev/null
+		"${CHECK[@]}" expect alert "agent=codex" || exit 1
+		;;
+	live-claude)
+		# Настоящий чат в окне стенда: сессию он заводит только на первом
+		# сообщении, и Stop-хук в конце ответа присылает сам Claude Code.
+		# Панель при этом на экране — значит алерта быть не должно.
+		echo "== настоящее событие от Claude Code"
+		bash "$0" sidebar > /dev/null; sleep 2
+		"${CHECK[@]}" ask claude "ответь одним словом: ok"
+		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
+		echo "-- чат завёл сессию ${session:0:8}, ответ пошёл"
+		"${CHECK[@]}" surfaces
+		kill_alerts
+		"${CHECK[@]}" pretend on
+		"${CHECK[@]}" wait-answer "$session" 20 || exit 1
+		"${CHECK[@]}" expect silence || exit 1
+		;;
+	live-codex)
+		# Единственный сценарий, где событие настоящее: его присылает сам Codex
+		# своим Stop-хуком. Остальные обходятся подделкой — она проверяет решение
+		# хука, а этот проверяет, что до хука вообще доходит живой агент.
+		# Событие присылает сам Codex, работающий в панели окна стенда, — своим
+		# Stop-хуком в конце ответа. Пока он отвечает, панель уступает место чату
+		# Claude Code: значит к моменту события чата Codex на экране нет.
+		echo "== настоящее событие от Codex"
+		bash "$0" codexbar > /dev/null; sleep 3
+		# Пауза в самом задании: ответ приходит быстрее, чем стенд успевает увести
+		# панель, и Stop заставал бы чат Codex ещё на экране — то есть проверял бы
+		# не тот случай.
+		"${CHECK[@]}" ask codex "выполни sleep 2, потом ответь одним словом: ok"
+		bash "$0" sidebar > /dev/null; sleep 2
+		echo "-- ответ идёт, а полоса уже переключена на чат Claude Code"
+		"${CHECK[@]}" containers
+		"${CHECK[@]}" pretend on
+		kill_alerts
+		# На прогретой панели алерт приходит через секунду после ответа, так что
+		# ждать тут нечего: длинный срок скрыл бы поломку, а не пережил её.
+		"${CHECK[@]}" wait-codex 10 || exit 1
+		"${CHECK[@]}" expect alert "agent=codex" 5 || exit 1
 		;;
 	*)
-		echo "сценарии: hidden | tab | watched | codex"; exit 1
+		echo "сценарии: hidden | tab | watched | codex | live-codex | live-claude"; exit 1
 		;;
 	esac
 	;;

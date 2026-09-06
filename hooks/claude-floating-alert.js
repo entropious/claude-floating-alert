@@ -126,13 +126,13 @@ function killPrevious(sessionId) {
 }
 
 /** Leave a trace the VS Code window can find when it wants the panel gone. */
-function rememberPanel(sessionId, pid, cwd, kind) {
+function rememberPanel(sessionId, pid, cwd, kind, agent) {
   if (!sessionId) return;
   try {
     fs.mkdirSync(RUN_DIR, { recursive: true });
     fs.writeFileSync(
       path.join(RUN_DIR, `${sessionId}.json`),
-      JSON.stringify({ pid, cwd, kind, window: WINDOW_ID })
+      JSON.stringify({ pid, cwd, kind, agent, window: WINDOW_ID })
     );
   } catch {}
 }
