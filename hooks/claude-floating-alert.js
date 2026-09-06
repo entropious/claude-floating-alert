@@ -15,6 +15,8 @@ const ROOT = path.join(HOME, ".claude", "floating-alert");
 const BINARY = path.join(ROOT, "bin", "claude-alert");
 const RUN_DIR = path.join(ROOT, "run");
 const FOCUS_DIR = path.join(ROOT, "focus");
+/** Optional: whether the chat is on screen, reported by a patched Claude Code. */
+const PRESENCE_DIR = path.join(ROOT, "presence");
 const CONFIG_FILE = path.join(ROOT, "config.json");
 /** Deep link a clicked panel opens to bring its chat forward. */
 const REVEAL_URL = "vscode://entro.claude-floating-alert/reveal";
@@ -222,12 +224,64 @@ function windowsFor(cwd) {
   return windows;
 }
 
+/** What one VS Code window last published about itself, if it is still alive. */
+function windowState(pid) {
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(FOCUS_DIR, `${pid}.json`), "utf-8"));
+    return isAlive(state.pid) ? state : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The focused VS Code window this session belongs to, if it is focused at all. */
 function focusedWindow(cwd) {
   for (const state of windowsFor(cwd)) {
     if (state.focused) return state;
   }
   return null;
+}
+
+/**
+ * What a Claude Code patched with the presence payload says about the chats of
+ * one window: one entry per surface, each naming its session, whether it is a
+ * tab or the side bar, and whether it is on screen. The file is written by the
+ * extension host of that window, which is the process the focus file names too.
+ *
+ * Returns null whenever nobody is reporting — an unpatched Claude Code, a
+ * Claude Code that has not started yet, a host that died and left its file
+ * behind — and the caller then falls back to what it can work out on its own.
+ */
+function chatSurfaces(pid) {
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(path.join(PRESENCE_DIR, `${pid}.json`), "utf-8"));
+  } catch {
+    return null;
+  }
+  if (!isAlive(state.pid)) return null;
+  return state.surfaces || [];
+}
+
+/** The surfaces holding one session, across every reporting window. */
+function surfacesOf(sessionId) {
+  if (!sessionId) return [];
+  let files = [];
+  try {
+    files = fs.readdirSync(PRESENCE_DIR);
+  } catch {
+    return [];
+  }
+  const found = [];
+  for (const name of files) {
+    const pid = Number(path.basename(name, ".json"));
+    const surfaces = chatSurfaces(pid);
+    if (!surfaces) continue;
+    for (const surface of surfaces) {
+      if (surface.session === sessionId) found.push({ ...surface, pid });
+    }
+  }
+  return found;
 }
 
 /**
@@ -241,7 +295,14 @@ function focusedWindow(cwd) {
  * VS Code open a second window whenever the two differ — a session started in a
  * subdirectory, a worktree, or a multi-root workspace.
  */
-function windowFolder(cwd) {
+function windowFolder(cwd, sessionId) {
+  // A window that reports this very session holds the chat, whatever its
+  // folders say — the surest answer there is, when someone is reporting.
+  for (const surface of surfacesOf(sessionId)) {
+    const state = windowState(surface.pid);
+    const folder = state && (state.folders || []).find((candidate) => isInside(cwd, candidate));
+    if (folder) return folder;
+  }
   for (const state of windowsFor(cwd)) {
     const folder = (state.folders || []).find((candidate) => isInside(cwd, candidate));
     if (folder) return folder;
@@ -255,6 +316,9 @@ function windowFolder(cwd) {
  * opens a second copy of the chat in the editor.
  */
 function sessionIsInTab(cwd, sessionId) {
+  const reported = surfacesOf(sessionId);
+  if (reported.length > 0) return reported.some((surface) => surface.kind === "tab");
+
   const marks = sessionMarks(cwd, sessionId);
   return windowsFor(cwd).some((state) =>
     (state.chatTabs || []).some((label) => tabBelongs(label, marks))
@@ -264,6 +328,13 @@ function sessionIsInTab(cwd, sessionId) {
 function sessionIsWatched(cwd, sessionId) {
   const window = focusedWindow(cwd);
   if (!window) return false;
+
+  // A patched Claude Code names the session behind every surface, so the answer
+  // is exact: this chat is in front of the user, or it is not.
+  const reported = chatSurfaces(window.pid);
+  if (reported) {
+    return reported.some((surface) => surface.session === sessionId && surface.visible);
+  }
 
   const marks = sessionMarks(cwd, sessionId);
   const own = (window.chatTabs || []).filter((label) => tabBelongs(label, marks));
@@ -332,7 +403,7 @@ function main(kind, input) {
       "--body", body,
       "--accent", config.accent,
       "--timeout", String(config.timeout),
-      "--folder", windowFolder(cwd),
+      "--folder", windowFolder(cwd, session),
       "--url", link,
       "--bundle-id", VSCODE_BUNDLE_ID,
     ],

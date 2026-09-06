@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- A chat that is not on screen no longer counts as watched. Where a Claude Code
+  patched with a presence payload reports its chat surfaces, the session behind
+  each one is known by id, so an alert is skipped only when that very chat is
+  visible — a side bar showing another view, or a chat tab behind other tabs, is
+  not. Without such a report everything works as before.
+- The window a clicked alert raises is picked by the session it holds, falling
+  back to a folder match.
+
 ## 1.0.0
 
 First release.
