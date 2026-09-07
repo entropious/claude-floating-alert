@@ -18,9 +18,9 @@
 #
 #   bash .probe/devhost.sh raise            дождаться, пока окно стенда в фокусе
 #   bash .probe/devhost.sh fire [kind]      прогнать хук: stop | permission | question
-#   bash .probe/devhost.sh case hidden      сценарий: чат в панели скрыт → ждём алерт
-#   bash .probe/devhost.sh case tab         сценарий: чат во вкладке за другой → ждём алерт
-#   bash .probe/devhost.sh case watched     сценарий: чат перед глазами → алерта быть не должно
+#   bash .probe/devhost.sh case matrix      все сочетания панели, вкладок и окна
+#   bash .probe/devhost.sh case matrix <кусок описания>
+#                                           только эти клетки, на уже поднятом окне
 #
 #   bash .probe/devhost.sh codex            запускает ли Codex наши хуки (доверие)
 #   bash .probe/devhost.sh containers       какая панель выбрана в окне стенда
@@ -69,6 +69,14 @@ release_focus() {
 	[ -n "$HOLD" ] && kill "$HOLD" 2>/dev/null
 	HOLD=""
 }
+
+# Алерт события «нужно разрешение» висит, пока его не нажмут, — и переживает
+# сценарий. Оставленный на экране, он потом уводит в папку стенда: её открытым
+# держит только профиль стенда, так что щелчок заводит новое окно.
+# Только на сценарий целиком: его шаги вызывают этот же скрипт, и уборка внутри
+# них снимала бы алерт, по которому шаг собирается щёлкнуть.
+cleanup() { release_focus; kill_alerts; }
+[ "${1:-}" = "case" ] && trap cleanup EXIT INT TERM
 
 case "${1:-}" in
 deps)
@@ -124,6 +132,12 @@ start)
 	;;
 
 stop)
+	# Сначала окно просят закрыться само: убитый хост редактор считает упавшим и
+	# при следующем запуске встречает диалогом «Reopen», который ждёт мышку.
+	if cdp_up; then
+		"${CHECK[@]}" command "Close Window" > /dev/null 2>&1
+		for _ in $(seq 1 10); do cdp_up || break; sleep 1; done
+	fi
 	for pid in $(host_pids); do kill "$pid" 2>/dev/null; done
 	# Редактор закрывается не мгновенно, а start считает живой CDP признаком
 	# уже поднятого окна и молча ничего не делает.
@@ -169,6 +183,55 @@ command)
 	;;
 
 sidebar)  "${CHECK[@]}" command "Claude Code: Open in Side Bar" ;;
+# Поверх редактора — чат или что угодно другое. Вкладки перебираются, пока окно
+# не скажет, что сверху нужное: гадать по числу переключений нельзя, порядок
+# вкладок меняется от прогона к прогону.
+chat-tab) "${CHECK[@]}" focus-tab chat && sleep 1 ;;
+code-tab) "${CHECK[@]}" focus-tab code && sleep 1 ;;
+# Панель в нужное положение, чем бы она ни была до того: щелчок по алерту сам
+# её открывает, и следующая проверка иначе смотрела бы на другое состояние.
+panel-hidden|panel-shown)
+	want="скрыта"; [ "$1" = "panel-shown" ] && want="видима"
+	for _ in $(seq 1 6); do
+		[ "$("${CHECK[@]}" panel)" = "$want" ] && { echo "панель: $want"; exit 0; }
+		if [ "$want" = "видима" ]; then bash "$0" sidebar > /dev/null; else bash "$0" hide > /dev/null; fi
+		sleep 2
+	done
+	echo "панель не встала в положение: $want"; exit 1
+	;;
+# Состояние клетки: панель скрыта или видна, поверх редактора чат или код.
+cell-state)
+	bash "$0" "panel-$2" > /dev/null || exit 1
+	bash "$0" "$3-tab" > /dev/null || exit 1
+	;;
+
+# Одно событие: при каком окне, для какой сессии, чего от него ждут и — когда
+# ждут алерт — куда обязан привести щелчок.
+#
+# Событие берётся из тех, что висят до ответа: у «задача готова» алерт гаснет
+# через три секунды, и нажимать было бы уже нечего.
+cell)
+	window="$2"; session="$3"; want="$4"; surface="$5"
+	kill_alerts
+	"${CHECK[@]}" forget > /dev/null
+	if [ "$window" = "focused" ]; then
+		"${CHECK[@]}" pretend on > /dev/null
+	else
+		"${CHECK[@]}" pretend off > /dev/null
+	fi
+	"${CHECK[@]}" fire permission "$session" > /dev/null
+	if [ "$want" = "silence" ]; then
+		"${CHECK[@]}" expect silence || exit 1
+	else
+		"${CHECK[@]}" expect alert || exit 1
+		# Цель уводится с экрана до щелчка: иначе проверка сошлась бы и без него —
+		# сессия и так на месте, а щелчок мог не сработать вовсе.
+		bash "$0" panel-hidden > /dev/null || exit 1
+		[ "$surface" = "tab" ] && { bash "$0" code-tab > /dev/null || exit 1; }
+		"${CHECK[@]}" press "$PROFILE" "$EXTENSIONS" > /dev/null || exit 1
+		"${CHECK[@]}" landed "$session" "$surface" || exit 1
+	fi
+	;;
 # Команда палитры открывает последнюю сессию, а её может и не быть. Кнопка в
 # списке сессий заводит вкладку с новой в любом случае, а сам список открывается
 # только иконкой в activity bar: его контейнер палитре не виден.
@@ -191,47 +254,18 @@ fire)
 case)
 	# Сессии и панели копятся от прогона к прогону, и сценарий начинает смотреть
 	# на чужое состояние — поэтому каждый идёт со свежего окна.
-	bash "$0" restart > /dev/null
+	#
+	# Кроме прогона одной клетки: `case matrix <кусок описания>` переиспользует
+	# уже поднятое окно и заведённые сессии, чтобы вернуться к упавшей клетке, а
+	# не гонять всю матрицу заново.
+	if [ -n "${3:-}" ] && [ -f "$ROOT/.probe/matrix-state" ]; then
+		. "$ROOT/.probe/matrix-state"
+		only="$3"
+	else
+		only=""
+		bash "$0" restart > /dev/null
+	fi
 	case "${2:-}" in
-	hidden)
-		echo "== чат в боковой панели, панель скрыта"
-		bash "$0" sidebar > /dev/null; sleep 2
-		# Сессию чат заводит только на первом сообщении, а без неё событие
-		# некому приписать: отчёты чата такой сессии не знают, и любая проверка
-		# выродилась бы в «алерт на выдуманный id».
-		"${CHECK[@]}" ask "ответь одним словом: ok"
-		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
-		bash "$0" hide > /dev/null; sleep 2
-		"${CHECK[@]}" surfaces
-		# Фокус подделывается последним: расширение переписывает файл окна на
-		# смене вкладок и папок, и подделка до этих шагов не дожила бы.
-		"${CHECK[@]}" pretend on
-		bash "$0" fire stop "$session" > /dev/null
-		"${CHECK[@]}" expect alert || exit 1
-		;;
-	tab)
-		echo "== чат вкладкой, поверх него другая вкладка"
-		bash "$0" tab > /dev/null; sleep 4
-		session=$("${CHECK[@]}" session tab) || { echo "вкладка чата не открылась"; exit 1; }
-		"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 2
-		# Новый файл открывается соседней группой, и чат остаётся на экране —
-		# а он должен уйти за вкладку, иначе проверять нечего.
-		"${CHECK[@]}" command "View: Join All Editor Groups" > /dev/null; sleep 2
-		"${CHECK[@]}" surfaces
-		"${CHECK[@]}" pretend on
-		bash "$0" fire stop "$session" > /dev/null
-		"${CHECK[@]}" expect alert || exit 1
-		;;
-	watched)
-		echo "== чат перед глазами"
-		bash "$0" sidebar > /dev/null; sleep 2
-		"${CHECK[@]}" ask "ответь одним словом: ok"
-		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
-		"${CHECK[@]}" surfaces
-		"${CHECK[@]}" pretend on
-		bash "$0" fire stop "$session" > /dev/null
-		"${CHECK[@]}" expect silence || exit 1
-		;;
 	codex)
 		# Что решает судьбу алерта Codex: панель, выбранная в боковой полосе.
 		# Сам чат Codex ни о чём не сообщает, поэтому сценарий переключает
@@ -269,22 +303,115 @@ case)
 		bash "$0" fire permission "" codex > /dev/null
 		"${CHECK[@]}" expect alert "agent=codex" || exit 1
 		;;
-	blur)
-		# Пишут в чат боковой панели и тут же уходят в код: панель остаётся на
-		# экране, активной становится вкладка редактора. Ответ приходит уже туда
-		# — и алерта быть не должно, чат ведь виден.
-		echo "== пишут в боковую панель, фокус уходит в код"
-		bash "$0" sidebar > /dev/null; sleep 2
-		"${CHECK[@]}" ask claude "напиши слово ok"
-		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
-		"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 2
-		echo "-- активна вкладка с кодом, чат сбоку остался"
+	matrix)
+		# Все сочетания того, что решает судьбу алерта: где живёт сессия события
+		# (боковая панель или вкладка), что из этого на экране и есть ли у окна
+		# фокус. Там, где алерт положен, проверяется и адрес ссылки: клик обязан
+		# вести в ту поверхность, где эта сессия и сидит.
+		echo "== матрица: панель, вкладки, окно"
+		if [ -n "$only" ]; then
+			echo "-- только клетки со словами: $only"
+		else
+		# Ждём панель по её же отчёту: свежее окно поднимает Claude Code не сразу,
+		# и команда палитры уходит в пустоту, пока он грузится.
+		bash "$0" panel-shown || exit 1
+		"${CHECK[@]}" ask claude "напиши слово один"
+		sidebar_session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
+		echo "-- в панели сессия ${sidebar_session:0:8}"
+
+		bash "$0" tab > /dev/null; sleep 2
+		"${CHECK[@]}" ask claude-tab "напиши слово два"
+		# Чат открывается соседней группой, и она заперта — файл ушёл бы в первую,
+		# а чат остался бы на экране. Со снятым замком он ложится к чату в одни
+		# вкладки, и «поверх» снова что-то значит.
+		"${CHECK[@]}" unlock
+		"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 1
+		# Вкладка сперва отчитывается сессией панели и поправляется, когда чат
+		# заговорит сам; ждём именно её собственную.
+		tab_session=$("${CHECK[@]}" wait-session tab 20 "$sidebar_session") || exit 1
+		echo "-- во вкладке сессия ${tab_session:0:8}"
 		"${CHECK[@]}" surfaces
-		kill_alerts
-		hold_focus
-		"${CHECK[@]}" wait-answer "$session" 20 || { release_focus; exit 1; }
-		"${CHECK[@]}" expect silence || { release_focus; exit 1; }
-		release_focus
+		# Сессии запоминаются, чтобы к упавшей клетке можно было вернуться, не
+		# поднимая окно и не заводя чаты заново.
+		printf 'sidebar_session=%s\ntab_session=%s\n' "$sidebar_session" "$tab_session" \
+			> "$ROOT/.probe/matrix-state"
+		fi
+
+		# Перебор осей: есть ли у окна фокус, видна ли панель, что поверх
+		# редактора. Каждая клетка выставляет состояние заново — щелчок по алерту
+		# сам открывает панель или вкладку, и следующей проверке досталось бы уже
+		# другое состояние.
+		#
+		# Ждём тишины ровно тогда, когда окно перед глазами и эта самая сессия на
+		# экране: панель показывает свою, вкладка — свою. Всё прочее — алерт, и
+		# тогда щелчок обязан привести в ту поверхность, где сессия сидит.
+		for window in focused blurred; do
+			for panel in shown hidden; do
+				for top in chat code; do
+					name="окно ${window}, панель ${panel}, поверх ${top}"
+					case "$name" in *"$only"*) ;; *) continue ;; esac
+					bash "$0" cell-state "$panel" "$top" || exit 1
+					echo "-- $name"
+
+					want_sidebar=alert
+					[ "$window" = focused ] && [ "$panel" = shown ] && want_sidebar=silence
+					bash "$0" cell "$window" "$sidebar_session" "$want_sidebar" sidebar || exit 1
+
+					bash "$0" cell-state "$panel" "$top" || exit 1
+					want_tab=alert
+					[ "$window" = focused ] && [ "$top" = chat ] && want_tab=silence
+					bash "$0" cell "$window" "$tab_session" "$want_tab" tab || exit 1
+				done
+			done
+		done
+
+		# Одна сессия сразу в двух местах: её же открываем вкладкой. Теперь на
+		# экране она, если видна панель или сверху её вкладка — любого из двух
+		# довольно.
+		#
+		# Подготовка каждой секции идёт только когда её клетки в прогоне: она
+		# закрывает вкладки и открывает новые, и при точечном прогоне сломала бы
+		# состояние, ради которого всё и затевалось.
+		case "одна сессия в двух местах" in *"$only"*)
+		"${CHECK[@]}" close-chat; sleep 1
+		"${CHECK[@]}" open-tab "$sidebar_session" "$PROFILE" "$EXTENSIONS"; sleep 2
+		# Вкладка снова открылась в запертой группе — файл ушёл бы в соседнюю.
+		"${CHECK[@]}" unlock
+		"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 1
+		for window in focused blurred; do
+			for panel in shown hidden; do
+				for top in chat code; do
+					name="одна сессия в двух местах: окно ${window}, панель ${panel}, поверх ${top}"
+					case "$name" in *"$only"*) ;; *) continue ;; esac
+					bash "$0" cell-state "$panel" "$top" || exit 1
+					echo "-- $name"
+					want=alert
+					[ "$window" = focused ] && { [ "$panel" = shown ] || [ "$top" = chat ]; } && want=silence
+					# Куда вести щелчку решает то, где сессию работали последней,
+					# и это меняется по ходу перебора — так что спрашиваем.
+					surface=$("${CHECK[@]}" expected "$sidebar_session")
+					bash "$0" cell "$window" "$sidebar_session" "$want" "$surface" || exit 1
+				done
+			done
+		done
+
+		;; esac
+
+		# Вкладки чата нет вовсе: сессия панели живёт только в ней.
+		case "вкладки чата нет" in *"$only"*)
+		"${CHECK[@]}" close-chat; sleep 1
+		for window in focused blurred; do
+			for panel in shown hidden; do
+				name="окно ${window}, панель ${panel}, вкладки чата нет"
+				case "$name" in *"$only"*) ;; *) continue ;; esac
+				bash "$0" panel-"$panel" > /dev/null || exit 1
+				echo "-- $name"
+				want=alert
+				[ "$window" = focused ] && [ "$panel" = shown ] && want=silence
+				bash "$0" cell "$window" "$sidebar_session" "$want" sidebar || exit 1
+			done
+		done
+		;; esac
 		;;
 	live-claude)
 		# Настоящий чат в окне стенда: сессию он заводит только на первом
@@ -327,7 +454,7 @@ case)
 		release_focus
 		;;
 	*)
-		echo "сценарии: hidden | tab | watched | blur | codex | live-codex | live-claude"; exit 1
+		echo "сценарии: matrix | codex | live-codex | live-claude"; exit 1
 		;;
 	esac
 	;;
