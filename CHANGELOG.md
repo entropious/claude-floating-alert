@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1
+
+- No more alert over the chat being answered in. A surface report that never
+  mentions a session used to count as proof the chat is not on screen; it is
+  only ever proof about the surfaces it names, so an unmentioned session now
+  falls back to the tabs and the window.
+- The fallback no longer mistakes a side bar chat for a tab in the background:
+  a session whose transcript cannot be read has no marks to match tab labels
+  against, and a tab still carrying the default label is no longer taken for
+  it. A click aims at the side bar in that case rather than at a stranger's tab.
+
 ## 1.2.0
 
 - Codex raises the same alerts. Its hooks go into `~/.codex/hooks.json` — where
