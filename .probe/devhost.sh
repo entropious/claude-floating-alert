@@ -53,6 +53,23 @@ host_pids() { ps ax -o pid,command | grep "user-data-dir=$PROFILE" | grep -v gre
 # Алерт живёт отдельным процессом и переживает окно, которое его открыло.
 kill_alerts() { pkill -f "floating-alert/bin/claude-alert" 2>/dev/null; true; }
 
+# Окно стенда числится активным, пока идёт ожидание. Одной записи мало:
+# расширение переписывает файл окна на своих событиях — а событий во время
+# живого ответа хватает, — и к проверке от подделки не осталось бы следа.
+HOLD=""
+hold_focus() {
+	release_focus
+	while :; do
+		"${CHECK[@]}" pretend on > /dev/null 2>&1
+		sleep 1
+	done &
+	HOLD=$!
+}
+release_focus() {
+	[ -n "$HOLD" ] && kill "$HOLD" 2>/dev/null
+	HOLD=""
+}
+
 case "${1:-}" in
 deps)
 	mkdir -p "$EXTENSIONS"
@@ -252,6 +269,23 @@ case)
 		bash "$0" fire permission "" codex > /dev/null
 		"${CHECK[@]}" expect alert "agent=codex" || exit 1
 		;;
+	blur)
+		# Пишут в чат боковой панели и тут же уходят в код: панель остаётся на
+		# экране, активной становится вкладка редактора. Ответ приходит уже туда
+		# — и алерта быть не должно, чат ведь виден.
+		echo "== пишут в боковую панель, фокус уходит в код"
+		bash "$0" sidebar > /dev/null; sleep 2
+		"${CHECK[@]}" ask claude "напиши слово ok"
+		session=$("${CHECK[@]}" wait-session sidebar 10) || exit 1
+		"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 2
+		echo "-- активна вкладка с кодом, чат сбоку остался"
+		"${CHECK[@]}" surfaces
+		kill_alerts
+		hold_focus
+		"${CHECK[@]}" wait-answer "$session" 20 || { release_focus; exit 1; }
+		"${CHECK[@]}" expect silence || { release_focus; exit 1; }
+		release_focus
+		;;
 	live-claude)
 		# Настоящий чат в окне стенда: сессию он заводит только на первом
 		# сообщении, и Stop-хук в конце ответа присылает сам Claude Code.
@@ -263,9 +297,10 @@ case)
 		echo "-- чат завёл сессию ${session:0:8}, ответ пошёл"
 		"${CHECK[@]}" surfaces
 		kill_alerts
-		"${CHECK[@]}" pretend on
-		"${CHECK[@]}" wait-answer "$session" 20 || exit 1
-		"${CHECK[@]}" expect silence || exit 1
+		hold_focus
+		"${CHECK[@]}" wait-answer "$session" 20 || { release_focus; exit 1; }
+		"${CHECK[@]}" expect silence || { release_focus; exit 1; }
+		release_focus
 		;;
 	live-codex)
 		# Единственный сценарий, где событие настоящее: его присылает сам Codex
@@ -283,15 +318,16 @@ case)
 		bash "$0" sidebar > /dev/null; sleep 2
 		echo "-- ответ идёт, а полоса уже переключена на чат Claude Code"
 		"${CHECK[@]}" containers
-		"${CHECK[@]}" pretend on
 		kill_alerts
+		hold_focus
 		# На прогретой панели алерт приходит через секунду после ответа, так что
 		# ждать тут нечего: длинный срок скрыл бы поломку, а не пережил её.
-		"${CHECK[@]}" wait-codex 10 || exit 1
-		"${CHECK[@]}" expect alert "agent=codex" 5 || exit 1
+		"${CHECK[@]}" wait-codex 10 || { release_focus; exit 1; }
+		"${CHECK[@]}" expect alert "agent=codex" 5 || { release_focus; exit 1; }
+		release_focus
 		;;
 	*)
-		echo "сценарии: hidden | tab | watched | codex | live-codex | live-claude"; exit 1
+		echo "сценарии: hidden | tab | watched | blur | codex | live-codex | live-claude"; exit 1
 		;;
 	esac
 	;;

@@ -157,9 +157,15 @@ function readSlice(file, from, length) {
  * default label, is renamed to the first thing the user said, and ends up with
  * the title Claude generates — and the transcript trails the tab, so all three
  * have to be considered.
+ *
+ * Null when the transcript cannot be read at all. A session with no marks and a
+ * session nothing is known about look the same from here, and treating the
+ * second as the first let any tab still carrying the default label pass for
+ * this session's own — a side bar chat then counted as a tab in the background,
+ * and answering in it raised an alert.
  */
 function sessionMarks(cwd, sessionId) {
-  if (!cwd || !sessionId) return {};
+  if (!cwd || !sessionId) return null;
   const file = path.join(HOME, ".claude", "projects", cwd.replace(/[/.]/g, "-"), `${sessionId}.jsonl`);
   let head;
   let tail;
@@ -169,7 +175,7 @@ function sessionMarks(cwd, sessionId) {
     const from = Math.max(0, size - TITLE_SCAN_BYTES);
     tail = from === 0 ? head : readSlice(file, from, size - from);
   } catch {
-    return {};
+    return null;
   }
 
   let aiTitle = "";
@@ -348,6 +354,9 @@ function sessionIsInTab(cwd, sessionId) {
   }
 
   const marks = sessionMarks(cwd, sessionId);
+  // Without a transcript no label can be tied to this session, and a guess here
+  // sends the click into someone else's chat. The side bar is the safer miss.
+  if (!marks) return false;
   return windowsFor(cwd).some((state) =>
     (state.chatTabs || []).some((label) => tabBelongs(label, marks))
   );
@@ -372,6 +381,8 @@ function sessionIsWatched(cwd, sessionId, agent) {
   if (mine.length > 0) return mine.some((surface) => surface.chat !== false && surface.visible);
 
   const marks = sessionMarks(cwd, sessionId);
+  // Nothing to match tabs against: the window is the only thing left to go on.
+  if (!marks) return true;
   const own = (window.chatTabs || []).filter((label) => tabBelongs(label, marks));
   // The chat is open as a tab: only the tab on top is in front of the user.
   if (own.length > 0) return own.includes(window.activeChat);
@@ -504,7 +515,7 @@ function main(kind, input, agent) {
     { detached: true, stdio: "ignore" }
   );
   child.unref();
-  rememberPanel(session, child.pid, cwd, kind);
+  rememberPanel(session, child.pid, cwd, kind, agent);
 }
 
 let raw = "";
