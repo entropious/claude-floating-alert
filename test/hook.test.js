@@ -221,6 +221,17 @@ test("ignores the sessions list, which shows no chat", () => {
   assert.ok(args, "the sessions list is not a chat on screen");
 });
 
+test("stays quiet for a session the report never mentions", () => {
+  // A chat tab whose session the patch has not published yet: the report names
+  // the side bar only, and saying nothing about this session is not the same as
+  // saying it is hidden.
+  const args = runHook("stop", {
+    focused: true,
+    presence: [{ session: "another-session", kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
+  });
+  assert.strictEqual(args, null, "an unmentioned session falls back to the window, not to an alert");
+});
+
 test("links to the surface the session was last worked in", () => {
   const args = runHook("stop", {
     focused: true,

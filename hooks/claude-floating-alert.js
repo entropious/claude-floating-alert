@@ -263,7 +263,7 @@ function focusedWindow(cwd) {
  * Claude Code that has not started yet, a host that died and left its file
  * behind — and the caller then falls back to what it can work out on its own.
  */
-function chatSurfaces(pid) {
+function chatSurfaces(pid, all) {
   let state;
   try {
     state = JSON.parse(fs.readFileSync(path.join(PRESENCE_DIR, `${pid}.json`), "utf-8"));
@@ -272,8 +272,10 @@ function chatSurfaces(pid) {
   }
   if (!isAlive(state.pid)) return null;
   // The sessions list is a webview of its own and names a session without ever
-  // showing it; a report that predates the distinction marks nothing.
-  return (state.surfaces || []).filter((surface) => surface.chat !== false);
+  // showing it; a report that predates the distinction marks nothing. Whoever
+  // asks for everything wants that entry too — naming a session without showing
+  // it still says the session exists, which silence does not.
+  return all ? state.surfaces || [] : (state.surfaces || []).filter((surface) => surface.chat !== false);
 }
 
 /** The surfaces holding one session, across every reporting window. */
@@ -359,10 +361,15 @@ function sessionIsWatched(cwd, sessionId, agent) {
 
   // A patched Claude Code names the session behind every surface, so the answer
   // is exact: this chat is in front of the user, or it is not.
-  const reported = chatSurfaces(window.pid);
-  if (reported) {
-    return reported.some((surface) => surface.session === sessionId && surface.visible);
-  }
+  //
+  // Exact only about the surfaces it does name, though. A report that never
+  // mentions this session says nothing about it — a chat tab the patch has not
+  // published yet is the ordinary case — and reading that silence as "not on
+  // screen" raised an alert over the very tab being typed in. Unmentioned means
+  // unknown, and unknown falls through to the tabs and the window below.
+  const reported = chatSurfaces(window.pid, true) || [];
+  const mine = reported.filter((surface) => surface.session === sessionId);
+  if (mine.length > 0) return mine.some((surface) => surface.chat !== false && surface.visible);
 
   const marks = sessionMarks(cwd, sessionId);
   const own = (window.chatTabs || []).filter((label) => tabBelongs(label, marks));

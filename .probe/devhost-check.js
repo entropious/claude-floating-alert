@@ -440,9 +440,17 @@ function pretend(active) {
  * напрямую, потому что клавиатурный ввод ушёл бы в то окно, что сейчас в
  * фокусе, а стенд намеренно работает в фоне.
  */
-/** Вебвью нужного расширения: у каждой панели свой CDP-таргет, и адрес его
- *  фрейма называет расширение, которому она принадлежит. */
-const PANELS = { claude: "extensionId=Anthropic.claude-code", codex: "extensionId=openai.chatgpt" };
+/**
+ * Вебвью нужной поверхности: у каждой свой CDP-таргет, и адрес фрейма называет
+ * и расширение, и вид поверхности — вьюха боковой панели помечена purpose,
+ * вкладка редактора нет. Чат в панели и чат во вкладке — разные сессии, и
+ * писать нужно ровно в ту, о которой идёт речь.
+ */
+const PANELS = {
+  claude: { mark: "extensionId=Anthropic.claude-code", view: true },
+  "claude-tab": { mark: "extensionId=Anthropic.claude-code", view: false },
+  codex: { mark: "extensionId=openai.chatgpt", view: true },
+};
 
 async function ask(text, who = "claude") {
   // Поле находит и фокусирует скрипт, а печатает CDP: редактор чата слушает
@@ -461,14 +469,15 @@ async function ask(text, who = "claude") {
     }
     return "";
   })()`;
-  const mark = PANELS[who];
-  if (!mark) {
-    console.error(`не знаю панель ${who}: claude | codex`);
+  const panel = PANELS[who];
+  if (!panel) {
+    console.error(`не знаю поверхность ${who}: ${Object.keys(PANELS).join(" | ")}`);
     process.exit(1);
   }
   for (const target of await targets()) {
     const url = target.url || "";
-    if (!url.startsWith("vscode-webview://") || !url.includes(mark)) continue;
+    if (!url.startsWith("vscode-webview://") || !url.includes(panel.mark)) continue;
+    if (url.includes("purpose=webviewView") !== panel.view) continue;
     const found = await evaluate(target.webSocketDebuggerUrl, focus);
     if (!found) continue;
     await send(target.webSocketDebuggerUrl, [
