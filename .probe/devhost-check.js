@@ -155,9 +155,11 @@ async function command(name) {
     ...key("p", "KeyP", 80, 12),
     { method: "Input.insertText", params: { text: `>${name}` } },
   ]);
-  await new Promise((done) => setTimeout(done, 600));
+  // Палитре нужно успеть отфильтровать список, а команде — выполниться; больше
+  // этого ждать нечего, а вызовов на прогон сотни.
+  await new Promise((done) => setTimeout(done, 250));
   await send(target.webSocketDebuggerUrl, key("\r", "Enter", 13, 0));
-  await new Promise((done) => setTimeout(done, 600));
+  await new Promise((done) => setTimeout(done, 250));
   return `выполнено: ${name}`;
 }
 
@@ -358,7 +360,7 @@ function pause(ms) {
  * нет» это тоже касается, поэтому ждут обе стороны, просто ответ на «нет»
  * известен только по истечении срока.
  */
-function expect(want, contains, seconds = 2) {
+function expect(want, contains, seconds = 1) {
   // Алерт живёт своей жизнью: у события «задача готова» он гаснет через
   // несколько секунд, и к моменту проверки на экране его уже нет. След
   // остаётся в run/ — по нему и видно, что алерт был.
@@ -430,6 +432,9 @@ async function focusTab(kind) {
     var box = hit.getBoundingClientRect();
     return {
       label: (hit.getAttribute("aria-label") || hit.innerText || "").trim().slice(0, 60),
+      // Уже наверху — клик ничего не изменит, а ожидание после него съедает
+      // секунду на каждой клетке.
+      already: hit.classList.contains("active"),
       x: Math.round(box.left + box.width / 2),
       y: Math.round(box.top + box.height / 2),
     };
@@ -439,12 +444,16 @@ async function focusTab(kind) {
     console.error(`вкладки вида ${kind} в окне нет`);
     process.exit(1);
   }
+  if (hit.already) return console.log(`поверх и так: ${hit.label}`);
   // Настоящий клик, а не hit.click(): редактор слушает мышь, а вызванный из
   // скрипта click вкладку подсвечивает, но наверх не выводит.
   await send(target.webSocketDebuggerUrl, [
     { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: hit.x, y: hit.y, button: "left", clickCount: 1 } },
     { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: hit.x, y: hit.y, button: "left", clickCount: 1 } },
   ]);
+  // Отчёт о поверхностях догоняет клик не мгновенно, а следующим шагом идёт
+  // проверка, которая по нему и судит.
+  pause(500);
   console.log(`поверх: ${hit.label}`);
 }
 
@@ -767,6 +776,23 @@ const PANELS = {
   codex: { mark: "extensionId=openai.chatgpt", view: true },
 };
 
+/**
+ * Идентификаторы вебвью, живущих в окне стенда. Панель одного расширения есть
+ * в каждом окне, и по одному лишь расширению их не различить — сообщение
+ * уходило в чужое окно. Зато рамки вебвью висят в DOM своего окна, и адрес
+ * рамки называет тот же id, что и адрес отладочной цели.
+ */
+async function ownWebviews() {
+  const target = await workbenchTarget();
+  const found = await evaluate(
+    target.webSocketDebuggerUrl,
+    `[].slice.call(document.querySelectorAll("iframe")).map(function (frame) { return frame.src || ""; })`
+  );
+  return (found || [])
+    .map((src) => (String(src).match(/[?&]id=([^&]+)/) || [])[1])
+    .filter(Boolean);
+}
+
 async function ask(text, who = "claude") {
   // Поле находит и фокусирует скрипт, а печатает CDP: редактор чата слушает
   // настоящий ввод, и подставленное из скрипта значение он не замечает.
@@ -789,17 +815,24 @@ async function ask(text, who = "claude") {
     console.error(`не знаю поверхность ${who}: ${Object.keys(PANELS).join(" | ")}`);
     process.exit(1);
   }
-  for (const target of await targets()) {
-    const url = target.url || "";
-    if (!url.startsWith("vscode-webview://") || !url.includes(panel.mark)) continue;
-    if (url.includes("purpose=webviewView") !== panel.view) continue;
-    const found = await evaluate(target.webSocketDebuggerUrl, focus);
-    if (!found) continue;
-    await send(target.webSocketDebuggerUrl, [
-      { method: "Input.insertText", params: { text } },
-      ...key("\r", "Enter", 13, 0),
-    ]);
-    return console.log(`отправлено в панель ${who} (${found}): ${text}`);
+  // Панель могла только что открыться: её рамка появляется в окне не сразу, а
+  // поле ввода внутри — ещё позже.
+  for (let waited = 0; waited < 6000; waited += 500) {
+    const mine = await ownWebviews();
+    for (const target of await targets()) {
+      const url = target.url || "";
+      if (!url.startsWith("vscode-webview://") || !url.includes(panel.mark)) continue;
+      if (url.includes("purpose=webviewView") !== panel.view) continue;
+      if (!mine.some((id) => url.includes(`id=${id}`))) continue;
+      const found = await evaluate(target.webSocketDebuggerUrl, focus);
+      if (!found) continue;
+      await send(target.webSocketDebuggerUrl, [
+        { method: "Input.insertText", params: { text } },
+        ...key("\r", "Enter", 13, 0),
+      ]);
+      return console.log(`отправлено в панель ${who} (${found}): ${text}`);
+    }
+    pause(500);
   }
   console.error(`панель ${who} не нашлась — открыта ли она в окне стенда?`);
   process.exit(1);
@@ -890,6 +923,22 @@ function waitCodex(seconds) {
     pause(500);
   }
   console.error(`за ${seconds} c Codex не ответил`);
+  process.exit(1);
+}
+
+/** Дождаться, пока поверхность нужного вида появится в окне: вкладка чата
+ *  открывается не мгновенно, а печатать в неё сразу некуда. */
+function waitSurface(kind, seconds) {
+  for (let waited = 0; waited < seconds * 1000; waited += 250) {
+    for (const state of readAll(path.join(ROOT, "presence"))) {
+      if (!alive(state.pid) || !(state.folders || []).includes(workspace())) continue;
+      if ((state.surfaces || []).some((surface) => surface.kind === kind && surface.chat !== false)) {
+        return console.log(`${kind} на месте`);
+      }
+    }
+    pause(250);
+  }
+  console.error(`за ${seconds} c не появилась поверхность вида ${kind}`);
   process.exit(1);
 }
 
@@ -1242,6 +1291,9 @@ async function main() {
     case "ask":
       await ask(rest.slice(1).join(" ") || "ответь одним словом: ok", rest[0] || "claude");
       break;
+    case "wait-surface":
+      waitSurface(rest[0] || "tab", Number(rest[1]) || 5);
+      break;
     case "wait-session":
       waitSession(rest[0] || "sidebar", Number(rest[1]) || 10, rest[2]);
       break;
@@ -1273,7 +1325,7 @@ async function main() {
       await closeChatTab();
       break;
     case "expect":
-      expect(rest[0] || "alert", rest[1], Number(rest[2]) || 2);
+      expect(rest[0] || "alert", rest[1], Number(rest[2]) || 1);
       break;
     case "forget":
       forget();
