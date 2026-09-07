@@ -18,7 +18,7 @@
 #
 #   bash .probe/devhost.sh raise            дождаться, пока окно стенда в фокусе
 #   bash .probe/devhost.sh fire [kind]      прогнать хук: stop | permission | question
-#   bash .probe/devhost.sh case matrix      все сочетания панели, вкладок и окна
+#   bash .probe/devhost.sh case matrix      все сочетания панели, вкладок и двух окон
 #   bash .probe/devhost.sh case matrix <кусок описания>
 #                                           только эти клетки, на уже поднятом окне
 #
@@ -42,6 +42,10 @@ export CDP_PORT="${CDP_PORT:-9333}"
 # рабочее окно, открытое на корне проекта. В ~/.claude её тоже не место: там
 # живут боевые файлы расширения, и стенд к ним ничего не добавляет.
 export PROBE_CWD="$(dirname "$ROOT")/.claude-floating-alert-probe"
+# Второе окно того же редактора — для проверок про разные окна. Папка своя по
+# той же причине: событие достаётся окну, у которого она открыта.
+PROBE_CWD1="$PROBE_CWD"
+PROBE_CWD2="$(dirname "$ROOT")/.claude-floating-alert-probe-2"
 ARGS=(--user-data-dir="$PROFILE" --extensions-dir="$EXTENSIONS")
 CHECK=(node "$ROOT/.probe/devhost-check.js")
 
@@ -131,10 +135,32 @@ start)
 	echo "окно готово, CDP на $CDP_PORT"
 	;;
 
+# Второе окно того же редактора: один профиль, один порт отладки — как у
+# пользователя, у которого просто два окна.
+#
+# Без --extensionDevelopmentPath: с ним запуск уходит в никуда, окна не будет.
+# Расширение из рабочего дерева второму окну и так достаётся — редактор держит
+# его для всего приложения, а не для окна, которым его открыли.
+second)
+	mkdir -p "$PROBE_CWD2"
+	"$CODE" "${ARGS[@]}" --new-window "$PROBE_CWD2" --disable-workspace-trust > /dev/null 2>&1 &
+	for _ in $(seq 1 15); do
+		sleep 1
+		PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" focus 2>/dev/null | grep -q "probe-2" && break
+	done
+	PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" focus | grep -q "probe-2" || {
+		echo "второе окно не поднялось"; exit 1
+	}
+	echo "второе окно готово"
+	;;
+
 stop)
-	# Сначала окно просят закрыться само: убитый хост редактор считает упавшим и
-	# при следующем запуске встречает диалогом «Reopen», который ждёт мышку.
+	# Сначала окна просят закрыться сами: убитое окно редактор считает упавшим и
+	# встречает диалогом «Reopen», который ждёт мышку. Просить надо каждое —
+	# команда доходит до того окна, чью папку ей называют.
 	if cdp_up; then
+		PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" command "Close Window" > /dev/null 2>&1
+		sleep 1
 		"${CHECK[@]}" command "Close Window" > /dev/null 2>&1
 		for _ in $(seq 1 10); do cdp_up || break; sleep 1; done
 	fi
@@ -145,8 +171,11 @@ stop)
 	for pid in $(host_pids); do kill -9 "$pid" 2>/dev/null; done
 	kill_alerts
 	# Чаты живых прогонов оба агента пишут туда же, куда пользовательские.
-	# Убираются они последними: пока окно живо, оно заводит их заново.
+	# Убираются они последними: пока окно живо, оно заводит их заново. У второго
+	# окна свои — по его папке.
 	"${CHECK[@]}" clean
+	PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" clean
+	rm -rf "$PROBE_CWD2"
 	echo "окно закрыто"
 	;;
 
@@ -199,6 +228,23 @@ panel-hidden|panel-shown)
 	done
 	echo "панель не встала в положение: $want"; exit 1
 	;;
+# Событие в окне такой-то папки. Фокус при этом не трогается: он уже расставлен,
+# и в проверках про два окна именно он и есть предмет.
+event)
+	folder="$2"; session="$3"; want="$4"; surface="$5"
+	kill_alerts
+	PROBE_CWD="$folder" "${CHECK[@]}" forget > /dev/null
+	PROBE_CWD="$folder" "${CHECK[@]}" fire permission "$session" > /dev/null
+	if [ "$want" = "silence" ]; then
+		PROBE_CWD="$folder" "${CHECK[@]}" expect silence || exit 1
+	else
+		PROBE_CWD="$folder" "${CHECK[@]}" expect alert || exit 1
+		PROBE_CWD="$folder" bash "$0" panel-hidden > /dev/null || exit 1
+		PROBE_CWD="$folder" "${CHECK[@]}" press "$PROFILE" "$EXTENSIONS" > /dev/null || exit 1
+		PROBE_CWD="$folder" "${CHECK[@]}" landed "$session" "$surface" || exit 1
+	fi
+	;;
+
 # Состояние клетки: панель скрыта или видна, поверх редактора чат или код.
 cell-state)
 	bash "$0" "panel-$2" > /dev/null || exit 1
@@ -216,6 +262,10 @@ cell)
 	"${CHECK[@]}" forget > /dev/null
 	if [ "$window" = "focused" ]; then
 		"${CHECK[@]}" pretend on > /dev/null
+	elif [ -n "${PROBE_OTHER:-}" ]; then
+		# Когда окон два, «фокуса нет» — это фокус в соседнем окне, а не пустота:
+		# так оно и бывает у пользователя, и чат отсюда всё равно не на экране.
+		PROBE_CWD="$PROBE_OTHER" "${CHECK[@]}" pretend on > /dev/null
 	else
 		"${CHECK[@]}" pretend off > /dev/null
 	fi
@@ -264,7 +314,11 @@ case)
 	else
 		only=""
 		bash "$0" restart > /dev/null
+		# Окон всегда два: у пользователя их столько же, и «фокуса нет» тогда
+		# значит не пустоту, а соседнее окно — как оно и бывает на самом деле.
+		bash "$0" second > /dev/null || exit 1
 	fi
+	export PROBE_OTHER="$PROBE_CWD2"
 	case "${2:-}" in
 	codex)
 		# Что решает судьбу алерта Codex: панель, выбранная в боковой полосе.
@@ -331,6 +385,13 @@ case)
 		tab_session=$("${CHECK[@]}" wait-session tab 20 "$sidebar_session") || exit 1
 		echo "-- во вкладке сессия ${tab_session:0:8}"
 		"${CHECK[@]}" surfaces
+		# Чаты, которыми заводились сессии, ещё отвечают, и в конце ответа каждый
+		# пришлёт свой Stop — настоящий алерт посреди первых же проверок. Ждём,
+		# пока договорят, и только потом начинаем.
+		"${CHECK[@]}" wait-answer "$sidebar_session" 30 || exit 1
+		"${CHECK[@]}" wait-answer "$tab_session" 30 || exit 1
+		kill_alerts
+
 		# Сессии запоминаются, чтобы к упавшей клетке можно было вернуться, не
 		# поднимая окно и не заводя чаты заново.
 		printf 'sidebar_session=%s\ntab_session=%s\n' "$sidebar_session" "$tab_session" \

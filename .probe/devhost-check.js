@@ -44,7 +44,10 @@ async function workbenchTarget() {
   const folder = path.basename(workspace());
   for (const candidate of list) {
     const title = await evaluate(candidate.webSocketDebuggerUrl, "document.title");
-    if (typeof title === "string" && title.includes(folder)) return candidate;
+    // Последнее слово заголовка и есть папка. Сравнивать вхождением нельзя:
+    // имя одной папки стенда — начало имени другой, и команда для первой
+    // доставалась бы второй.
+    if (typeof title === "string" && title.trim().split(/\s+/).pop() === folder) return candidate;
   }
   throw new Error(`среди окон нет открытого на ${folder}`);
 }
@@ -250,7 +253,7 @@ function openTab(session, profile, extensions) {
   console.log(`вкладкой открыта сессия ${session.slice(0, 8)}`);
 }
 
-function press(profile, extensions) {
+async function press(profile, extensions) {
   const line = alertLines()[0];
   if (!line) {
     console.error("на экране нет алерта, нажимать нечего");
@@ -261,6 +264,15 @@ function press(profile, extensions) {
     console.error("у алерта нет ссылки");
     process.exit(1);
   }
+  // Сперва поднимается окно папки, и лишь потом идёт ссылка — тем же порядком,
+  // каким это делает щелчок по алерту. Иначе ссылку получит окно, которое
+  // сейчас активно, а оно чужой cwd не узнаёт и промолчит.
+  //
+  // Поднимает именно открытие папки: bringToFront через отладчик выводит окно
+  // внутри процесса, но редактор адресует ссылку не по этому признаку.
+  spawnSync(CODE_CLI, [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`, workspace()], {
+    encoding: "utf-8",
+  });
   const code = CODE_CLI;
   const result = spawnSync(
     code,
@@ -1267,7 +1279,7 @@ async function main() {
       forget();
       break;
     case "press":
-      press(rest[0] || path.join(__dirname, "vscode-user"), rest[1] || path.join(__dirname, "vscode-ext"));
+      await press(rest[0] || path.join(__dirname, "vscode-user"), rest[1] || path.join(__dirname, "vscode-ext"));
       break;
     case "open-tab":
       openTab(rest[0], rest[1] || path.join(__dirname, "vscode-user"), rest[2] || path.join(__dirname, "vscode-ext"));
