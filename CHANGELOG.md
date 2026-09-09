@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0
+
+- An alert that waits for an answer — a permission request or a question — now
+  has a close button. Until now the only way to get rid of one was to click it,
+  and a click goes to the chat; the button dismisses the panel and leaves the
+  chat where it is. Alerts that fade on their own carry no button.
+
 ## 1.2.1
 
 - No more alert over the chat being answered in. A surface report that never
