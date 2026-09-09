@@ -78,6 +78,8 @@ final class AlertPanel: NSPanel {
 /// Background of the panel — the whole surface is the click target.
 final class ClickableEffectView: NSVisualEffectView {
     var onClick: (() -> Void)?
+    /// The one thing that answers clicks on its own; everything else is surface.
+    var passthrough: NSView?
 
     override func mouseDown(with event: NSEvent) {
         onClick?()
@@ -85,7 +87,9 @@ final class ClickableEffectView: NSVisualEffectView {
 
     /// Swallow hits on the labels so any point of the panel triggers the click.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        super.hitTest(point) != nil ? self : nil
+        guard let hit = super.hitTest(point) else { return nil }
+        if let passthrough, hit === passthrough || hit.isDescendant(of: passthrough) { return hit }
+        return self
     }
 }
 
@@ -95,7 +99,10 @@ final class Controller: NSObject {
     private var dismissTimer: Timer?
 
     private let width: CGFloat = 450
-    private var textWidth: CGFloat { width - 34 }
+    /// An alert that closes itself needs no button; one that waits for an answer
+    /// has to be dismissible without going to the chat it came from.
+    private var hasClose: Bool { opts.timeout <= 0 }
+    private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
     /// Long commands wrap instead of being cut off, up to this many lines.
     private let bodyLines = 5
     /// Keeps a one-line alert from looking like a sliver.
@@ -174,6 +181,17 @@ final class Controller: NSObject {
                 rest.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 6),
             ]
         }
+        if hasClose {
+            let close = closeButton()
+            container.addSubview(close)
+            container.passthrough = close
+            constraints += [
+                close.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+                close.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+                close.widthAnchor.constraint(equalToConstant: 30),
+                close.heightAnchor.constraint(equalToConstant: 30),
+            ]
+        }
         NSLayoutConstraint.activate(constraints)
 
         container.layoutSubtreeIfNeeded()
@@ -215,6 +233,26 @@ final class Controller: NSObject {
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return }
         panel.setFrameOrigin(NSPoint(x: visible.maxX - width - 16, y: visible.minY + 16))
+    }
+
+    /// Closes the alert and nothing more: the chat stays where it is, and the
+    /// event is left unanswered on purpose.
+    private func closeButton() -> NSButton {
+        let button = NSButton()
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.title = ""
+        button.image = NSImage(
+            systemSymbolName: "xmark",
+            accessibilityDescription: "Close"
+        )?.withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
+        button.contentTintColor = .secondaryLabelColor
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = #selector(dismiss)
+        button.toolTip = "Close"
+        return button
     }
 
     private func label(
