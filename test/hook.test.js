@@ -69,6 +69,7 @@ function makeHome(options) {
       chatTabs: options.chatTabs || [],
       activeChat: options.activeChat || "",
       codexTab: options.codexTab || false,
+      accept: options.accept || false,
       state,
       at: new Date().toISOString(),
     })
@@ -99,7 +100,12 @@ function runHook(kind, options, agent) {
   const { home, spawned } = makeHome(options);
   const args = agent ? [HOOK, kind, "--agent", agent] : [HOOK, kind];
   const result = spawnSync(process.execPath, args, {
-    input: JSON.stringify({ session_id: SESSION, cwd: CWD, tool_name: "Bash" }),
+    input: JSON.stringify({
+      session_id: SESSION,
+      cwd: CWD,
+      tool_name: "Bash",
+      ...(options.payload || {}),
+    }),
     // The debug line is what says an alert was decided against, which is the
     // difference between "no alert" and "the alert has not started yet".
     env: { ...process.env, HOME: home, VSCODE_IPC_HOOK_CLI: "", CFA_DEBUG: "1" },
@@ -193,6 +199,42 @@ test("raises no window of its own when nothing has the folder open", () => {
   }
   const args = JSON.parse(fs.readFileSync(spawned, "utf-8"));
   assert.strictEqual(flag(args, "--folder"), "", "a folder no window has open would open a new one");
+});
+
+test("a question asked through the permission hook stays a question", () => {
+  const args = runHook("permission", {
+    focused: false,
+    payload: {
+      tool_name: "AskUserQuestion",
+      tool_input: { questions: [{ question: "Which database?" }] },
+    },
+  });
+  assert.strictEqual(flag(args, "--accent"), "purple");
+  assert.strictEqual(flag(args, "--body"), "Which database?");
+});
+
+test("offers to answer where a window says it can", () => {
+  const args = runHook("permission", { focused: false, accept: true });
+  assert.match(flag(args, "--accept-file"), new RegExp(`accept/${process.pid}\\.json$`));
+});
+
+test("offers no answer where no window can give one", () => {
+  const args = runHook("permission", { focused: false });
+  assert.strictEqual(flag(args, "--accept-file"), "");
+});
+
+test("offers no answer for a finished task", () => {
+  const args = runHook("stop", { focused: false, accept: true });
+  assert.strictEqual(flag(args, "--accept-file"), "");
+});
+
+test("offers no answer to a question, which has to be read first", () => {
+  const args = runHook("permission", {
+    focused: false,
+    accept: true,
+    payload: { tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Which?" }] } },
+  });
+  assert.strictEqual(flag(args, "--accept-file"), "");
 });
 
 console.log("with a presence report");

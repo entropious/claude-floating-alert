@@ -39,6 +39,18 @@ const WINDOW_ID = process.env.VSCODE_IPC_HOOK_CLI || "";
 /** Kinds that wait for an answer: they outrank the purely informational ones. */
 const BLOCKING = new Set(["permission", "question"]);
 
+/** The tools that are a question to the user rather than a thing being done. */
+const QUESTION_TOOLS = new Set(["AskUserQuestion", "request_user_input"]);
+
+/**
+ * A question the agent asks reaches the permission hook too — asking is what it
+ * needs permission for — and would then be shown as a permission request, in
+ * the colour of one. It is a question whichever event carried it.
+ */
+function questionKind(kind, input) {
+  return kind === "permission" && QUESTION_TOOLS.has(input.tool_name) ? "question" : kind;
+}
+
 /** Agents whose hooks land here, and the name the panel calls them by. */
 const AGENTS = { claude: "Claude", codex: "Codex" };
 
@@ -95,6 +107,18 @@ function toolDetail(input) {
   if (args.url) return truncate(args.url, BODY_MAX);
   if (args.description) return truncate(args.description, BODY_MAX);
   return "";
+}
+
+/**
+ * The question being asked. One call can carry several of them; the first is
+ * the one the chat shows first, and the rest follow it there.
+ */
+function questionText(input) {
+  const args = input.tool_input || {};
+  if (Array.isArray(args.questions) && args.questions.length > 0) {
+    return args.questions[0].question || "";
+  }
+  return args.question || "";
 }
 
 function workspaceName(cwd, agent) {
@@ -488,7 +512,7 @@ function compose(kind, input, agent) {
       return {
         subtitle,
         title: `${name} asked a question`,
-        body: truncate((input.tool_input || {}).question || "Your choice is needed", BODY_MAX),
+        body: truncate(questionText(input) || "Your choice is needed", BODY_MAX),
       };
     default:
       return { subtitle, title: `${name} is done`, body: "Task finished, waiting for you." };
@@ -533,12 +557,12 @@ function main(kind, input, agent) {
       })}`
     : "";
 
-  // An event that waits for an answer can be answered from the alert itself,
-  // where the window holding the chat has the extension that tells it to take
-  // the first option. Everything else — a finished task, a Codex chat that
-  // extension knows nothing about, a window without it — gets no such button,
-  // and the path stays empty.
-  const acceptPid = BLOCKING.has(kind) && agent !== "codex" ? acceptWindow(cwd, session) : 0;
+  // A permission request can be granted from the alert itself, where the window
+  // holding the chat has the extension that tells it to take the first option.
+  // Everything else gets no such button: a finished task has nothing to answer,
+  // a Codex chat is beyond that extension, and a question has to be read before
+  // it can be answered — taking its first option blind is not an answer.
+  const acceptPid = kind === "permission" && agent !== "codex" ? acceptWindow(cwd, session) : 0;
   const accept = acceptPid ? path.join(ACCEPT_DIR, `${acceptPid}.json`) : "";
 
   killPrevious(session);
@@ -566,13 +590,12 @@ let raw = "";
 process.stdin.setEncoding("utf-8");
 process.stdin.on("data", (chunk) => (raw += chunk));
 process.stdin.on("end", () => {
-  const kind = process.argv[2] || "";
   let input = {};
   try {
     input = JSON.parse(raw);
   } catch {}
   try {
-    main(kind, input, agentId(process.argv));
+    main(questionKind(process.argv[2] || "", input), input, agentId(process.argv));
   } catch {}
   process.exit(0);
 });

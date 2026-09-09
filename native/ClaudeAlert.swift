@@ -113,8 +113,10 @@ final class Controller: NSObject {
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
     /// Long commands wrap instead of being cut off, up to this many lines.
     private let bodyLines = 5
-    /// Keeps a one-line alert from looking like a sliver.
-    private let minHeight: CGFloat = 104
+    /// The panel is as tall as what is in it: the padding around the text is
+    /// what keeps a short alert from looking like a sliver, and a minimum on top
+    /// of that only shows up as a band of nothing.
+    private let minHeight: CGFloat = 0
 
     init(opts: Options) {
         self.opts = opts
