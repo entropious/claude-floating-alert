@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { execFile } from "child_process";
 import {
+  ACCEPT_DIR,
   BINARY,
   CONFIG_FILE,
   FOCUS_DIR,
@@ -17,6 +18,7 @@ import {
 /** Per-window socket path, shared with the terminals this window spawns. */
 const WINDOW_ID = process.env.VSCODE_IPC_HOOK_CLI || "";
 const FOCUS_FILE = path.join(FOCUS_DIR, `${process.pid}.json`);
+const ACCEPT_FILE = path.join(ACCEPT_DIR, `${process.pid}.json`);
 
 let statusItem: vscode.StatusBarItem;
 
@@ -61,6 +63,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.tabGroups.onDidChangeTabs(() => publishFocus(vscode.window.state.focused)),
     vscode.window.onDidChangeActiveTextEditor(() => publishFocus(vscode.window.state.focused)),
     vscode.window.tabGroups.onDidChangeTabGroups(() => publishFocus(vscode.window.state.focused)),
+    watchAccepts(),
     { dispose: forgetFocus }
   );
 }
@@ -138,6 +141,48 @@ function findStateDatabase(context: vscode.ExtensionContext): void {
   if (fs.existsSync(file)) stateDatabase = file;
 }
 
+/**
+ * The extension that can answer a request without anyone opening the chat: it
+ * tells the chat to take the first option. Only where it is installed does the
+ * alert offer that button, so its presence travels with the window state.
+ */
+const COLORIZER = "local.claude-code-colorizer";
+const ACCEPT_COMMAND = "claudeCodeColorizer.acceptFirstOption";
+
+function canAccept(): boolean {
+  return vscode.extensions.getExtension(COLORIZER) !== undefined;
+}
+
+/**
+ * Watch for the answer a clicked accept button leaves for this window, and take
+ * the first option as soon as one shows up. The file is deleted before the
+ * command runs, so a slow chat cannot collect two answers for one press.
+ */
+function watchAccepts(): vscode.Disposable {
+  let watcher: fs.FSWatcher | undefined;
+  try {
+    fs.mkdirSync(ACCEPT_DIR, { recursive: true });
+    // A window that died with a file waiting would answer the moment it comes
+    // back, long after the request it was meant for.
+    forgetAccepts();
+    watcher = fs.watch(ACCEPT_DIR, () => {
+      if (!forgetAccepts()) return;
+      void run(ACCEPT_COMMAND);
+    });
+  } catch {}
+  return { dispose: () => { watcher?.close(); forgetAccepts(); } };
+}
+
+/** Takes this window's answer file away, saying whether there was one. */
+function forgetAccepts(): boolean {
+  try {
+    fs.unlinkSync(ACCEPT_FILE);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Tell the hook script whether this window — not just VS Code — is focused. */
 function publishFocus(focused: boolean): void {
   const chats = chatTabs();
@@ -153,6 +198,7 @@ function publishFocus(focused: boolean): void {
         chatTabs: chats.titles,
         activeChat: chats.active,
         codexTab: codexTabActive(),
+        accept: canAccept(),
         state: stateDatabase,
         at: new Date().toISOString(),
       })

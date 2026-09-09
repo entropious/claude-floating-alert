@@ -21,6 +21,15 @@ const PRESENCE_DIR = path.join(ROOT, "presence");
 const CONFIG_FILE = path.join(ROOT, "config.json");
 /** Deep link a clicked panel opens to bring its chat forward. */
 const REVEAL_URL = "vscode://entro.claude-floating-alert/reveal";
+/**
+ * Where the accept button leaves its answer, one file per window: the window
+ * holding the chat watches for its own and takes the first option.
+ *
+ * A deep link would go to whichever window VS Code hands it to — the last
+ * active one, which at the moment of the click is by definition not the one
+ * with the chat, or the alert would never have fired.
+ */
+const ACCEPT_DIR = path.join(ROOT, "accept");
 
 const VSCODE_BUNDLE_ID = "com.microsoft.VSCode";
 /** Per-window socket path: the same value in the window's terminals and its
@@ -338,6 +347,32 @@ function windowFolder(cwd, sessionId) {
 }
 
 /**
+ * The extension host to leave the answer for: the window holding this chat,
+ * among those saying they can answer at all.
+ *
+ * Same order as raising a window: a window reporting the session itself is the
+ * sure answer, and without reports the closest folder around it wins.
+ */
+function acceptWindow(cwd, sessionId) {
+  const windows = windowsFor(cwd).filter((state) => state.accept);
+  for (const surface of surfacesOf(sessionId)) {
+    const reporting = windows.find((state) => state.pid === surface.pid);
+    if (reporting) return reporting.pid;
+  }
+  let best = null;
+  let closest = -1;
+  for (const state of windows) {
+    for (const folder of state.folders || []) {
+      if (isInside(cwd, folder) && folder.length > closest) {
+        closest = folder.length;
+        best = state;
+      }
+    }
+  }
+  return best ? best.pid : 0;
+}
+
+/**
  * True when some window has this chat open as a tab. Revealing a tab and
  * opening the side bar are different commands, and asking for the wrong one
  * opens a second copy of the chat in the editor.
@@ -498,6 +533,14 @@ function main(kind, input, agent) {
       })}`
     : "";
 
+  // An event that waits for an answer can be answered from the alert itself,
+  // where the window holding the chat has the extension that tells it to take
+  // the first option. Everything else — a finished task, a Codex chat that
+  // extension knows nothing about, a window without it — gets no such button,
+  // and the path stays empty.
+  const acceptPid = BLOCKING.has(kind) && agent !== "codex" ? acceptWindow(cwd, session) : 0;
+  const accept = acceptPid ? path.join(ACCEPT_DIR, `${acceptPid}.json`) : "";
+
   killPrevious(session);
 
   const child = spawn(
@@ -510,6 +553,7 @@ function main(kind, input, agent) {
       "--timeout", String(config.timeout),
       "--folder", windowFolder(cwd, session),
       "--url", link,
+      "--accept-file", accept,
       "--bundle-id", VSCODE_BUNDLE_ID,
     ],
     { detached: true, stdio: "ignore" }

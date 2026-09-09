@@ -10,7 +10,8 @@
 //
 // Usage:
 //   claude-alert --title "..." --body "..." [--subtitle "..."] [--accent orange]
-//                [--timeout 0] [--folder /path] [--url vscode://…] [--bundle-id id]
+//                [--timeout 0] [--folder /path] [--url vscode://…]
+//                [--accept-file /path] [--bundle-id id]
 
 import AppKit
 
@@ -26,6 +27,10 @@ struct Options {
     var folder = ""
     /// Deep link opened once that window is in front, to reveal the chat.
     var url = ""
+    /// File the accept button writes for the window holding the chat, which
+    /// watches for it. Empty where nothing can answer, and then the alert
+    /// offers no such button.
+    var acceptFile = ""
     var bundleID = "com.microsoft.VSCode"
 }
 
@@ -47,6 +52,7 @@ func parseArgs() -> Options {
         case "--accent": o.accent = take()
         case "--folder": o.folder = take()
         case "--url": o.url = take()
+        case "--accept-file": o.acceptFile = take()
         case "--bundle-id": o.bundleID = take()
         case "--timeout": o.timeout = Double(take()) ?? 0
         default: break
@@ -78,8 +84,8 @@ final class AlertPanel: NSPanel {
 /// Background of the panel — the whole surface is the click target.
 final class ClickableEffectView: NSVisualEffectView {
     var onClick: (() -> Void)?
-    /// The one thing that answers clicks on its own; everything else is surface.
-    var passthrough: NSView?
+    /// The few things that answer clicks on their own; everything else is surface.
+    var passthrough: [NSView] = []
 
     override func mouseDown(with event: NSEvent) {
         onClick?()
@@ -88,7 +94,7 @@ final class ClickableEffectView: NSVisualEffectView {
     /// Swallow hits on the labels so any point of the panel triggers the click.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let hit = super.hitTest(point) else { return nil }
-        if let passthrough, hit === passthrough || hit.isDescendant(of: passthrough) { return hit }
+        if passthrough.contains(where: { hit === $0 || hit.isDescendant(of: $0) }) { return hit }
         return self
     }
 }
@@ -102,6 +108,8 @@ final class Controller: NSObject {
     /// An alert that closes itself needs no button; one that waits for an answer
     /// has to be dismissible without going to the chat it came from.
     private var hasClose: Bool { opts.timeout <= 0 }
+    /// Only where something on the other side can answer the request.
+    private var hasAccept: Bool { !opts.acceptFile.isEmpty }
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
     /// Long commands wrap instead of being cut off, up to this many lines.
     private let bodyLines = 5
@@ -132,12 +140,26 @@ final class Controller: NSObject {
         stripe.layer?.backgroundColor = accent.cgColor
         stripe.translatesAutoresizingMaskIntoConstraints = false
 
+        let accept = hasAccept ? acceptButton() : nil
+        // The button hangs over the bottom-right corner of the body, which flows
+        // around it: only the last lines are cut short, the ones above keep the
+        // full width. Without a body there is nothing to flow, and the button
+        // gets a line of its own below the text.
+        let flows = accept != nil && !opts.body.isEmpty
+
         var textViews: [NSView] = []
         textViews.append(label(opts.title, size: 14, weight: .bold, color: .labelColor, lines: 2))
         if !opts.body.isEmpty {
-            textViews.append(
-                label(opts.body, size: 12, weight: .regular, color: .secondaryLabelColor, lines: bodyLines)
-            )
+            if let accept, flows {
+                let size = accept.fittingSize
+                textViews.append(
+                    flowingBody(opts.body, around: NSSize(width: size.width + 12, height: size.height))
+                )
+            } else {
+                textViews.append(
+                    label(opts.body, size: 12, weight: .regular, color: .secondaryLabelColor, lines: bodyLines)
+                )
+            }
         }
 
         let textStack = NSStackView(views: textViews)
@@ -162,12 +184,36 @@ final class Controller: NSObject {
         // which stays pinned to the top-left corner and out of the reckoning.
         let rest = NSLayoutGuide()
         container.addLayoutGuide(rest)
-        constraints += [
-            rest.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
-            textStack.centerYAnchor.constraint(equalTo: rest.centerYAnchor),
-            textStack.topAnchor.constraint(greaterThanOrEqualTo: rest.topAnchor),
-            textStack.bottomAnchor.constraint(lessThanOrEqualTo: rest.bottomAnchor),
-        ]
+        if let accept {
+            container.addSubview(accept)
+            container.passthrough.append(accept)
+            constraints += [
+                accept.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+                accept.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            ]
+        }
+        if flows {
+            // The hole in the body was cut for the button sitting at its bottom
+            // right, so the text has to end where the button does.
+            constraints += [
+                rest.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+                textStack.bottomAnchor.constraint(equalTo: rest.bottomAnchor),
+                textStack.topAnchor.constraint(greaterThanOrEqualTo: rest.topAnchor),
+            ]
+        } else {
+            if let accept {
+                constraints.append(rest.bottomAnchor.constraint(equalTo: accept.topAnchor, constant: -8))
+            } else {
+                constraints.append(
+                    rest.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
+                )
+            }
+            constraints += [
+                textStack.centerYAnchor.constraint(equalTo: rest.centerYAnchor),
+                textStack.topAnchor.constraint(greaterThanOrEqualTo: rest.topAnchor),
+                textStack.bottomAnchor.constraint(lessThanOrEqualTo: rest.bottomAnchor),
+            ]
+        }
 
         if opts.subtitle.isEmpty {
             constraints.append(rest.topAnchor.constraint(equalTo: container.topAnchor, constant: 12))
@@ -184,7 +230,7 @@ final class Controller: NSObject {
         if hasClose {
             let close = closeButton()
             container.addSubview(close)
-            container.passthrough = close
+            container.passthrough.append(close)
             constraints += [
                 close.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
                 close.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
@@ -253,6 +299,89 @@ final class Controller: NSObject {
         button.action = #selector(dismiss)
         button.toolTip = "Close"
         return button
+    }
+
+    /// Answers the request from here: the link picks the first option in the
+    /// chat, and the panel goes away without anything coming to the front.
+    private func acceptButton() -> NSButton {
+        let button = NSButton()
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        button.title = "Accept"
+        button.font = .systemFont(ofSize: 13, weight: .semibold)
+        button.image = NSImage(
+            systemSymbolName: "checkmark",
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
+        button.imagePosition = .imageLeading
+        button.target = self
+        button.action = #selector(accept)
+        button.toolTip = "Accept"
+        return button
+    }
+
+    /// Like a dismissal that also answers: the file is left for the window
+    /// holding the chat, nothing is brought forward, and the panel goes away.
+    @objc private func accept() {
+        try? Data("1".utf8).write(to: URL(fileURLWithPath: opts.acceptFile))
+        dismiss()
+    }
+
+    /// Body text with a hole for the button in its bottom-right corner: the
+    /// last lines stop at the button, everything above runs the full width.
+    ///
+    /// Where that hole goes depends on how tall the text turns out, and the
+    /// height depends on the hole, so the two are settled by repeating the
+    /// layout until it stops moving — which it does in a pass or two.
+    private func flowingBody(_ text: String, around avoid: NSSize) -> NSTextView {
+        let storage = NSTextStorage(
+            string: text,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+        )
+        let layout = NSLayoutManager()
+        let box = NSTextContainer(size: NSSize(width: textWidth, height: .greatestFiniteMagnitude))
+        box.lineFragmentPadding = 0
+        box.maximumNumberOfLines = bodyLines
+        box.lineBreakMode = .byTruncatingTail
+        layout.addTextContainer(box)
+        storage.addLayoutManager(layout)
+
+        func used() -> CGFloat {
+            layout.ensureLayout(for: box)
+            return ceil(layout.usedRect(for: box).maxY)
+        }
+        var height = used()
+        for _ in 0..<4 {
+            box.exclusionPaths = [
+                NSBezierPath(
+                    rect: NSRect(
+                        x: textWidth - avoid.width,
+                        y: height - avoid.height,
+                        width: avoid.width,
+                        height: avoid.height
+                    )
+                )
+            ]
+            let next = used()
+            if abs(next - height) < 0.5 { break }
+            height = next
+        }
+
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: textWidth, height: height), textContainer: box)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.isEditable = false
+        view.isSelectable = false
+        view.drawsBackground = false
+        view.textContainerInset = .zero
+        NSLayoutConstraint.activate([
+            view.widthAnchor.constraint(equalToConstant: textWidth),
+            view.heightAnchor.constraint(equalToConstant: height),
+        ])
+        return view
     }
 
     private func label(
