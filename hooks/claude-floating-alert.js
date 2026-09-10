@@ -96,12 +96,24 @@ function truncate(value, max) {
 
 /** As much text as the panel can wrap across its five body lines. */
 const BODY_MAX = 300;
+/**
+ * As much of a command as the panel takes when unfolded. It shows the first
+ * lines of it and grows to the rest on a click, so what goes across is the
+ * whole thing — line breaks and all, since a command is read by its shape.
+ */
+const COMMAND_MAX = 2000;
+
+/** Keeps the text as it was written, cutting it off where it gets absurd. */
+function clip(value, max) {
+  const text = String(value || "").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 
 /** Human-readable summary of what the tool is about to do. */
 function toolDetail(input) {
   const tool = input.tool_name || "";
   const args = input.tool_input || {};
-  if (tool === "Bash" && args.command) return truncate(args.command, BODY_MAX);
+  if (tool === "Bash" && args.command) return clip(args.command, COMMAND_MAX);
   if (args.file_path) return truncate(args.file_path.replace(HOME, "~"), BODY_MAX);
   if (args.pattern) return truncate(args.pattern, BODY_MAX);
   if (args.url) return truncate(args.url, BODY_MAX);

@@ -99,6 +99,20 @@ final class ClickableEffectView: NSVisualEffectView {
     }
 }
 
+/// Wraps the text it is given into one click target of its own, so a click on
+/// the command unfolds it instead of going where a click on the panel goes.
+final class ClickableBox: NSView {
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) == nil ? nil : self
+    }
+}
+
 final class Controller: NSObject {
     private let opts: Options
     private var panel: AlertPanel!
@@ -111,8 +125,28 @@ final class Controller: NSObject {
     /// Only where something on the other side can answer the request.
     private var hasAccept: Bool { !opts.acceptFile.isEmpty }
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
-    /// Long commands wrap instead of being cut off, up to this many lines.
-    private let bodyLines = 5
+    /// Whether the whole command is on screen, or only its first lines.
+    private var expanded = false
+    /// Long commands wrap instead of being cut off, up to this many lines —
+    /// as many as the screen holds once the alert has been expanded.
+    private var bodyLines: Int { expanded ? expandedLines : collapsedLines }
+    private let collapsedLines = 5
+    /// The body is the command about to run, and it is what the alert is read
+    /// for — the title above it only says which kind of event this is. A shade
+    /// off the full label colour keeps the title first all the same.
+    private let bodyColor = NSColor.labelColor.withAlphaComponent(0.82)
+    /// A command longer than the screen is cut off even expanded; the whole of
+    /// it is in the chat, and the alert is not where it gets read.
+    private var expandedLines: Int {
+        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        let room = (screen?.visibleFrame.height ?? 800) * 0.7 - 90
+        return max(collapsedLines, Int(room / 15))
+    }
+    /// A body that does not fit its five lines gets an arrow to unfold it.
+    private lazy var hasExpand: Bool = {
+        guard !opts.body.isEmpty else { return false }
+        return lines(opts.body, width: textWidth) > collapsedLines
+    }()
     /// The panel is as tall as what is in it: the padding around the text is
     /// what keeps a short alert from looking like a sliver, and a minimum on top
     /// of that only shows up as a band of nothing.
@@ -122,7 +156,7 @@ final class Controller: NSObject {
         self.opts = opts
     }
 
-    func show() {
+    private func content() -> ClickableEffectView {
         let accent = accentColor(opts.accent)
 
         let container = ClickableEffectView()
@@ -149,19 +183,49 @@ final class Controller: NSObject {
         // gets a line of its own below the text.
         let flows = accept != nil && !opts.body.isEmpty
 
-        var textViews: [NSView] = []
-        textViews.append(label(opts.title, size: 14, weight: .bold, color: .labelColor, lines: 2))
+        let title = label(opts.title, size: 14, weight: .bold, color: .labelColor, lines: 2)
+        var textViews: [NSView] = [title]
         if !opts.body.isEmpty {
-            if let accept, flows {
+            // What is cut off is said by a line of dots under the text: the last
+            // line of a command ends in an ellipsis of its own often enough for
+            // one there to say nothing.
+            let cut = hasExpand && !expanded
+            var text: NSView
+            if let accept, flows, !cut {
                 let size = accept.fittingSize
-                textViews.append(
-                    flowingBody(opts.body, around: NSSize(width: size.width + 12, height: size.height))
-                )
+                text = flowingBody(bodyText(), around: NSSize(width: size.width + 12, height: size.height))
             } else {
-                textViews.append(
-                    label(opts.body, size: 12, weight: .regular, color: .secondaryLabelColor, lines: bodyLines)
-                )
+                text = coloured(bodyText(), lines: bodyLines)
             }
+            if cut {
+                // The dots are the bottom line of the panel, where the answer
+                // button also sits: they end where it begins.
+                let taken = accept.map { $0.fittingSize.width + 12 } ?? 0
+                let dots = label("⋯", size: 18, weight: .semibold, color: .secondaryLabelColor, lines: 1)
+                dots.widthAnchor.constraint(equalToConstant: textWidth - taken).isActive = true
+                let stack = NSStackView(views: [text, dots])
+                stack.orientation = .vertical
+                stack.alignment = .leading
+                stack.spacing = 0
+                stack.translatesAutoresizingMaskIntoConstraints = false
+                text = stack
+            }
+            // Where there is more to see, the text itself is the way to see it.
+            if hasExpand {
+                let box = ClickableBox()
+                box.onClick = { [weak self] in self?.toggleExpanded() }
+                box.translatesAutoresizingMaskIntoConstraints = false
+                box.addSubview(text)
+                NSLayoutConstraint.activate([
+                    text.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+                    text.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+                    text.topAnchor.constraint(equalTo: box.topAnchor),
+                    text.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+                ])
+                container.passthrough.append(box)
+                text = box
+            }
+            textViews.append(text)
         }
 
         let textStack = NSStackView(views: textViews)
@@ -241,7 +305,11 @@ final class Controller: NSObject {
             ]
         }
         NSLayoutConstraint.activate(constraints)
+        return container
+    }
 
+    func show() {
+        let container = content()
         container.layoutSubtreeIfNeeded()
         let height = max(container.fittingSize.height, minHeight)
 
@@ -303,6 +371,23 @@ final class Controller: NSObject {
         return button
     }
 
+    /// Shows the rest of a command that did not fit, and folds it back. The
+    /// panel grows upwards from its corner, so nothing else on screen moves.
+    @objc private func toggleExpanded() {
+        expanded.toggle()
+        let container = content()
+        container.layoutSubtreeIfNeeded()
+        let height = max(container.fittingSize.height, minHeight)
+        let frame = panel.frame
+        panel.contentView = container
+        // The origin stays where it is and the height grows from it: the panel
+        // sits in the bottom corner, so the text unfolds upwards.
+        panel.setFrame(
+            NSRect(x: frame.minX, y: frame.minY, width: width, height: height),
+            display: true
+        )
+    }
+
     /// Answers the request from here: the link picks the first option in the
     /// chat, and the panel goes away without anything coming to the front.
     private func acceptButton() -> NSButton {
@@ -330,20 +415,127 @@ final class Controller: NSObject {
         dismiss()
     }
 
+    /// The body of a permission alert, coloured where it is a shell command:
+    /// what runs, what it is given, and the punctuation between the two.
+    ///
+    /// The hook puts the tool in front of the command — `Bash · git push` — and
+    /// that prefix is what says the rest is a command at all. Anything else is
+    /// prose and stays one colour.
+    private func bodyText() -> NSAttributedString {
+        let font = NSFont.systemFont(ofSize: 12)
+        let prefix = "Bash · "
+        guard opts.body.hasPrefix(prefix) else {
+            return NSAttributedString(
+                string: opts.body,
+                attributes: [.font: font, .foregroundColor: bodyColor]
+            )
+        }
+        let out = NSMutableAttributedString(
+            string: prefix,
+            attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+        )
+        out.append(highlighted(String(opts.body.dropFirst(prefix.count))))
+        return out
+    }
+
+    /// Colours a shell command. Nothing here parses the shell: it tells apart
+    /// the word a command starts with, the options handed to it, quoted text,
+    /// variables and comments — which is what makes a command readable at a
+    /// glance, and all that fits on an alert.
+    private func highlighted(_ text: String) -> NSAttributedString {
+        let font = NSFont.systemFont(ofSize: 12)
+        let strong = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let out = NSMutableAttributedString()
+        func add(_ piece: String, _ color: NSColor, _ face: NSFont? = nil) {
+            out.append(
+                NSAttributedString(string: piece, attributes: [.font: face ?? font, .foregroundColor: color])
+            )
+        }
+
+        let chars = Array(text)
+        // Everything that ends one command and starts the next; the first word
+        // after one of them is a command again.
+        let breaks = Set("|&;\n(){}")
+        let stops = Set(" \t\n|&;(){}<>\"'")
+        var starting = true
+        var index = 0
+        while index < chars.count {
+            let char = chars[index]
+            if char == "\"" || char == "'" {
+                var end = index + 1
+                while end < chars.count, chars[end] != char { end += 1 }
+                let last = min(end, chars.count - 1)
+                add(String(chars[index...last]), .systemGreen)
+                index = last + 1
+                starting = false
+                continue
+            }
+            if char == "#", index == 0 || chars[index - 1] == "\n" || chars[index - 1] == " " {
+                var end = index
+                while end < chars.count, chars[end] != "\n" { end += 1 }
+                add(String(chars[index..<end]), .tertiaryLabelColor)
+                index = end
+                continue
+            }
+            if breaks.contains(char) || char == "<" || char == ">" {
+                add(String(char), .secondaryLabelColor)
+                starting = true
+                index += 1
+                continue
+            }
+            if char == " " || char == "\t" {
+                add(String(char), bodyColor)
+                index += 1
+                continue
+            }
+            var end = index
+            while end < chars.count, !stops.contains(chars[end]) { end += 1 }
+            let word = String(chars[index..<end])
+            if word.hasPrefix("-") {
+                add(word, .labelColor)
+            } else if word.hasPrefix("$") {
+                add(word, .systemPurple)
+            } else if starting {
+                add(word, .systemTeal, strong)
+                starting = false
+            } else {
+                add(word, bodyColor)
+            }
+            index = end
+        }
+        return out
+    }
+
+    /// How many lines the body takes at a given width, with nothing clamping it.
+    private func lines(_ text: String, width: CGFloat) -> Int {
+        let storage = NSTextStorage(string: text, attributes: [.font: NSFont.systemFont(ofSize: 12)])
+        let layout = NSLayoutManager()
+        let box = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        box.lineFragmentPadding = 0
+        layout.addTextContainer(box)
+        storage.addLayoutManager(layout)
+        layout.ensureLayout(for: box)
+
+        var count = 0
+        var index = 0
+        let glyphs = layout.numberOfGlyphs
+        while index < glyphs {
+            var range = NSRange()
+            layout.lineFragmentRect(forGlyphAt: index, effectiveRange: &range)
+            index = NSMaxRange(range)
+            count += 1
+        }
+        return count
+    }
+
     /// Body text with a hole for the button in its bottom-right corner: the
     /// last lines stop at the button, everything above runs the full width.
     ///
     /// Where that hole goes depends on how tall the text turns out, and the
     /// height depends on the hole, so the two are settled by repeating the
     /// layout until it stops moving — which it does in a pass or two.
-    private func flowingBody(_ text: String, around avoid: NSSize) -> NSTextView {
-        let storage = NSTextStorage(
-            string: text,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]
-        )
+    private func flowingBody(_ text: NSAttributedString, around avoid: NSSize) -> NSTextView {
+        let storage = NSTextStorage(attributedString: text)
         let layout = NSLayoutManager()
         let box = NSTextContainer(size: NSSize(width: textWidth, height: .greatestFiniteMagnitude))
         box.lineFragmentPadding = 0
@@ -384,6 +576,22 @@ final class Controller: NSObject {
             view.heightAnchor.constraint(equalToConstant: height),
         ])
         return view
+    }
+
+    /// A label of text that carries its own colours, wrapped and clamped the
+    /// same way a plain one is.
+    private func coloured(_ text: NSAttributedString, lines: Int) -> NSTextField {
+        let field = NSTextField(labelWithAttributedString: text)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.lineBreakMode = .byTruncatingTail
+        field.maximumNumberOfLines = lines
+        field.preferredMaxLayoutWidth = textWidth
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.usesSingleLineMode = false
+        field.cell?.wraps = true
+        field.cell?.isScrollable = false
+        field.setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
+        return field
     }
 
     private func label(
