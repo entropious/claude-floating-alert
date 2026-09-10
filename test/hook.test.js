@@ -175,7 +175,7 @@ test("asks for the side bar when no tab holds the chat", () => {
   const args = runHook("stop", { focused: false });
   assert.match(flag(args, "--ask-click"), /"tab":false/);
   assert.match(flag(args, "--ask-file"), new RegExp(`ask/${process.pid}\\.json$`));
-  assert.strictEqual(flag(args, "--url"), "", "a named window needs no link");
+  assert.strictEqual(flag(args, "--url"), "", "a named window is asked, not linked");
 });
 
 test("raises no window of its own when nothing has the folder open", () => {

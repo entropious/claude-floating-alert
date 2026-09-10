@@ -95,6 +95,9 @@ look_at() {
 		"$CODE" "${ARGS[@]}" "$1" > /dev/null 2>&1
 	fi
 	# Расширение пишет фокус на своём событии, и оно приходит не мгновенно.
+	# Полсекунды сверху — редактору на то, чтобы разобраться с окнами: сразу
+	# после переключения он ещё не готов вывести вперёд соседнее окно по просьбе.
+	sleep 0.5
 	for _ in $(seq 1 20); do
 		sleep 0.3
 		if [ "$1" = "none" ]; then
@@ -111,7 +114,14 @@ look_at() {
 host_pids() { ps ax -o pid,command | grep "user-data-dir=$PROFILE" | grep -v grep | awk '{print $1}'; }
 
 # Алерт живёт отдельным процессом и переживает окно, которое его открыло.
-kill_alerts() { pkill -f "floating-alert/bin/claude-alert" 2>/dev/null; true; }
+# Только панели стенда: рядом идёт обычная работа, и её алерт ждёт ответа —
+# снимать его прогону не за чем.
+kill_alerts() {
+	for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
+		pkill -f "claude-alert .*--folder $folder " 2>/dev/null
+	done
+	true
+}
 
 # Окно стенда числится активным, пока идёт ожидание. Одной записи мало:
 # расширение переписывает файл окна на своих событиях — а событий во время
@@ -174,6 +184,13 @@ flavour)
 		exit 0
 	fi
 	echo "$want" > "$ROOT/.probe/flavour"
+	exec bash "$0" profile "$want"
+	;;
+
+# Собрать профиль нужного вида, ничего не запоминая: этим прогон и переключает
+# виды внутри себя, и запись здесь свела бы «оба» к последнему из них.
+profile)
+	want="${2:-patched}"
 	bash "$0" deps > /dev/null || exit 1
 	if [ "$want" = "plain" ]; then
 		# Патч оставляет рядом исходные файлы — по ним копия возвращается к
@@ -205,7 +222,15 @@ start)
 	  "update.mode": "none",
 	  "update.showReleaseNotes": false,
 	  "telemetry.telemetryLevel": "off",
-	  "extensions.autoUpdate": false
+	  "extensions.autoUpdate": false,
+	  // Патч поднимает на старте последнюю сессию, а она общая на всю машину:
+	  // свежее окно стенда встречало бы чат из рабочего окна, и сценарий начинал
+	  // бы гонять чужую сессию вместо своей.
+	  "claudeCodeColorizer.loadLastSessionOnStartup": false,
+	  // Claude Code запоминает, куда открывать чат, и после работы в панели
+	  // открывает вкладкой туда же. Стенду нужны обе поверхности: панель он
+	  // открывает своей командой, а «вкладкой» должно значить вкладкой.
+	  "claudeCode.preferredLocation": "editor"
 	}
 	JSON
 	mkdir -p "$PROBE_CWD"
@@ -345,6 +370,11 @@ hide-chat)
 	[ -n "${2:-}" ] && export PROBE_CWD="$2"
 	"${CHECK[@]}" hide-chat
 	;;
+# Нажать висящий алерт события такой-то папки — его же кодом.
+press)
+	[ -n "${2:-}" ] && export PROBE_CWD="$2"
+	"${CHECK[@]}" press
+	;;
 # Выражение в главном фрейме окна такой-то папки — чтобы разбираться с разметкой
 # редактора, не угадывая её.
 eval)
@@ -396,7 +426,7 @@ event)
 	else
 		PROBE_CWD="$folder" "${CHECK[@]}" expect alert || exit 1
 		PROBE_CWD="$folder" bash "$0" panel-hidden > /dev/null || exit 1
-		PROBE_CWD="$folder" "${CHECK[@]}" press "$PROFILE" "$EXTENSIONS" > /dev/null || exit 1
+		PROBE_CWD="$folder" "${CHECK[@]}" press > /dev/null || exit 1
 		PROBE_CWD="$folder" "${CHECK[@]}" landed "$session" "$surface" || exit 1
 	fi
 	;;
@@ -474,8 +504,15 @@ cell)
 			bash "$0" panel-hidden > /dev/null || exit 1
 			[ "$surface" = "tab" ] && { bash "$0" code-tab > /dev/null || exit 1; }
 		fi
-		"${CHECK[@]}" press "$PROFILE" "$EXTENSIONS" > /dev/null || exit 1
-		"${CHECK[@]}" landed "$session" "$surface" || exit 1
+		# Место, куда Claude Code открывает чат по команде, он переписывает сам —
+		# и открытая в клетке панель делает «вкладкой» пустым словом.
+		[ "$surface" = "tab" ] && "${CHECK[@]}" prefer editor > /dev/null
+		"${CHECK[@]}" press || exit 1
+		# Когда редактора на экране не было вовсе, вывести его вперёд — дело
+		# системы, и разрешение на это она даёт по настоящему щелчку, которого
+		# прогону взять негде.
+		[ "$here" = "none" ] && away=away || away=here
+		"${CHECK[@]}" landed "$session" "$surface" "$away" || exit 1
 	fi
 	;;
 # Команда палитры открывает последнюю сессию, а её может и не быть. Кнопка в
@@ -510,7 +547,7 @@ case)
 		chosen=$(cat "$ROOT/.probe/flavour" 2>/dev/null || echo "patched plain")
 		for flavour in $chosen; do
 			echo "=== профиль: $flavour"
-			bash "$0" flavour "$flavour" > /dev/null || exit 1
+			bash "$0" profile "$flavour" > /dev/null || exit 1
 			PROBE_FLAVOUR="$flavour" bash "$0" "$@" || status=1
 		done
 		exit "$status"

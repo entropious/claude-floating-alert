@@ -10,3 +10,4 @@ bin/
 .probe/*
 !.probe/devhost.sh
 !.probe/devhost-check.js
+!.probe/open-in-stand.sh

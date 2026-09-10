@@ -256,61 +256,48 @@ function openTab(session, profile, extensions) {
 }
 
 /**
- * Не щелчок, а его повторение: из аргументов висящей панели берётся то, с чем
- * её позвали, и проделывается ровно то же, что сделал бы её код, — просьба
- * окну, потом само окно вперёд. Проверяется этим не панель, а то, что ей
- * передал хук.
+ * Нажать висящий алерт по-настоящему: его же кодом.
  *
- * Настоящим щелчком это не сделать. Мышью — нужны права Accessibility, которых
- * у прогона нет; изнутри панели — она зовёт `open -b com.microsoft.VSCode`, то
- * есть обычный редактор с рабочим профилем, и папка стенда открылась бы новым
- * окном не там, где идёт прогон.
+ * Мышью щёлкнуть нечем — синтетическое нажатие требует прав Accessibility,
+ * которых у прогона нет, — поэтому панели посылается сигнал, по которому она
+ * делает ровно то же, что делает по щелчку. Проверяется таким образом её
+ * собственное поведение: и просьба окну, и подъём окна.
+ *
+ * Панель зовёт редактор через `open`, а он ведёт к обычному профилю; чтобы
+ * попасть в профиль стенда, ей подсовывается свой способ (CFA_OPEN) — на нём же
+ * она и была запущена. Здесь остаётся только нажать и дождаться, пока она
+ * доделает своё дело и уйдёт.
  */
-async function press(profile, extensions) {
+async function press() {
   const line = alertLines()[0];
   if (!line) {
     console.error("на экране нет алерта, нажимать нечего");
     process.exit(1);
   }
-  // Просьба адресована окну по имени файла, и это главный путь; ссылка остаётся
-  // на случай, когда окна для события не нашлось.
-  const askFile = (line.match(/--ask-file (\S+)/) || [])[1];
-  const click = (line.match(/--ask-click (\{.*?\}) --/) || [])[1];
-  if (askFile && click) {
-    fs.mkdirSync(path.dirname(askFile), { recursive: true });
-    fs.writeFileSync(askFile, click);
-    spawnSync(CODE_CLI, [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`, workspace()], {
-      encoding: "utf-8",
-    });
-    spawnSync("pkill", ["-f", "floating-alert/bin/claude-alert"]);
-    return console.log(`нажат алерт: ${click}`);
-  }
-  const url = (line.match(/--url (\S+)/) || [])[1];
-  if (!url) {
-    console.error("у алерта нет ни просьбы, ни ссылки");
+  const pid = Number(line.trim().split(/\s+/)[0]);
+  if (!pid) {
+    console.error(`не разобрать номер процесса алерта: ${line.slice(0, 80)}`);
     process.exit(1);
   }
-  // Сперва поднимается окно папки, и лишь потом идёт ссылка — тем же порядком,
-  // каким это делает щелчок по алерту. Иначе ссылку получит окно, которое
-  // сейчас активно, а оно чужой cwd не узнаёт и промолчит.
-  //
-  // Поднимает именно открытие папки: bringToFront через отладчик выводит окно
-  // внутри процесса, но редактор адресует ссылку не по этому признаку.
-  spawnSync(CODE_CLI, [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`, workspace()], {
-    encoding: "utf-8",
-  });
-  const code = CODE_CLI;
-  const result = spawnSync(
-    code,
-    [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`, "--open-url", url],
-    { encoding: "utf-8" }
-  );
-  if (result.status !== 0) {
-    console.error(`ссылка не доставлена: ${(result.stderr || "").trim().slice(0, 200)}`);
+  try {
+    process.kill(pid, "SIGUSR1");
+  } catch (error) {
+    console.error(`алерт не принял нажатие: ${error}`);
     process.exit(1);
   }
-  spawnSync("pkill", ["-f", "floating-alert/bin/claude-alert"]);
-  console.log(`нажат алерт: ${url.slice(0, 90)}`);
+  // Панель гаснет сама, закончив дело; ждём именно этого, а не времени.
+  // С чем панель осталась, с тем щелчок и работает: пустая папка — это «подними
+  // приложение», а не «подними то окно», и по молчаливому провалу этого не видно.
+  const folder = (line.match(/--folder (\S*)/) || [])[1] || "";
+  const ask = (line.match(/--ask-file (\S*)/) || [])[1] || "";
+  for (let waited = 0; waited < 10000; waited += 250) {
+    if (!alive(pid)) {
+      return console.log(`нажат алерт: папка ${folder || "—"}, просьба ${ask || "—"}`);
+    }
+    pause(250);
+  }
+  console.error("алерт не закрылся после нажатия");
+  process.exit(1);
 }
 
 /**
@@ -318,15 +305,23 @@ async function press(profile, extensions) {
  * поверхности. Ожидание короткое — окно уже поднято, речь про одну команду.
  */
 /**
- * При честном фокусе щелчок обязан ещё и вывести вперёд окно события: в
- * подделке этого не проверить — фокус там назначается файлом.
+ * При честном фокусе щелчок обязан ещё и вывести вперёд окно события — но
+ * спрашивать это можно не всегда.
+ *
+ * В подделке фокус назначается файлом, и проверять нечего. А когда редактор
+ * был убран целиком, вперёд его выводит система, и разрешение на это она даёт
+ * тому, с кем человек только что имел дело: настоящий щелчок по панели такое
+ * разрешение даёт, а сигнал, которым панель нажимает прогон, — нет. Требовать
+ * этого от прогона значит требовать того, чего он не умеет изобразить.
  */
+let mustBeInFront = true;
+
 function windowInFront() {
   let mode = "pretend";
   try {
     mode = fs.readFileSync(path.join(__dirname, "focus-mode"), "utf-8").trim();
   } catch {}
-  if (mode !== "real") return true;
+  if (mode !== "real" || !mustBeInFront) return true;
   return !!(standWindow() || {}).focused;
 }
 
@@ -357,7 +352,46 @@ async function landed(session, kind, seconds) {
       console.log(`      ${surface.kind} ${surface.visible ? "видима" : "скрыта"} ${surface.session}`);
     }
   }
+  whoIsInFront();
   process.exitCode = 1;
+}
+
+/**
+ * Куда Claude Code открывает чат по команде «показать сессию».
+ *
+ * Он помнит последнее место сам и переписывает свою настройку каждый раз, когда
+ * чат открывают в полосе, — а стенд открывает его там в каждой клетке. Поэтому
+ * перед проверкой щелчка место назначается заново: иначе «открыть вкладкой»
+ * означало бы «открыть там же, где было в прошлый раз».
+ */
+function prefer(where) {
+  const file = path.join(__dirname, "vscode-user", "User", "settings.json");
+  const key = '"claudeCode.preferredLocation"';
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf-8");
+  } catch {
+    console.error(`нет настроек профиля стенда: ${file}`);
+    process.exit(1);
+  }
+  const line = `${key}: ${JSON.stringify(where)}`;
+  const has = new RegExp(`${key}\\s*:\\s*"[^"]*"`);
+  const next = has.test(text)
+    ? text.replace(has, line)
+    : text.replace(/\}\s*$/, `,\n  ${line}\n}\n`);
+  fs.writeFileSync(file, next);
+  console.log(`чат открывается: ${where}`);
+}
+
+/** Что о фокусе говорят сами окна — чтобы провал не сводился к «не вышло». */
+function whoIsInFront() {
+  for (const state of readAll(path.join(ROOT, "focus"))) {
+    if (!alive(state.pid)) continue;
+    console.log(
+      `      окно ${state.pid} ${state.focused ? "в фокусе" : "в фоне"} ` +
+        `(${(state.folders || []).map((f) => path.basename(f)).join(", ")}), ${state.at}`
+    );
+  }
 }
 
 /** Отчитывается ли о чатах кто-нибудь в окне стенда. */
@@ -386,7 +420,12 @@ async function landedPlain(session, kind, seconds) {
     pause(250);
   }
   console.log(`FAIL  щелчок не открыл ${kind} для ${session.slice(0, 8)}`);
-  console.log(`      поверх редактора: ${(standWindow() || {}).activeChat || "не чат"}`);
+  console.log(
+    `      поверх редактора: ${(standWindow() || {}).activeChat || "не чат"}` +
+      `, чат в полосе: ${(await chatBarShown()) ? "виден" : "нет"}` +
+      `, окно впереди: ${windowInFront() ? "да" : "нет"}`
+  );
+  whoIsInFront();
   process.exitCode = 1;
 }
 
@@ -451,9 +490,19 @@ function forget() {
   console.log(`забыто следов: ${names.length}`);
 }
 
+/**
+ * Панели, поднятые событиями стенда, — и только они.
+ *
+ * Рядом идёт обычная работа, и её алерты висят на том же экране: посчитанные
+ * за свои, они превращали чужой запрос разрешения в «алерт был» там, где
+ * проверялась тишина. Отбор по папке: её событие и назвало.
+ */
 function alertLines() {
   const out = spawnSync("pgrep", ["-fl", "claude-alert"], { encoding: "utf-8" }).stdout || "";
-  return out.split("\n").filter((line) => line.includes("--title"));
+  return out
+    .split("\n")
+    .filter((line) => line.includes("--title"))
+    .filter((line) => line.includes(`--folder ${workspace()} `));
 }
 
 function alerts() {
@@ -484,7 +533,16 @@ function expect(want, contains, seconds = 1) {
       return fs
         .readdirSync(RUN_DIR)
         .map((name) => path.join(RUN_DIR, name))
-        .filter((file) => fs.statSync(file).mtimeMs >= since);
+        .filter((file) => fs.statSync(file).mtimeMs >= since)
+        // След чужого алерта — от работы, идущей рядом, — тишиной стенда не
+        // считается и в его проверки попадать не должен.
+        .filter((file) => {
+          try {
+            return JSON.parse(fs.readFileSync(file, "utf-8")).cwd === workspace();
+          } catch {
+            return false;
+          }
+        });
     } catch {
       return [];
     }
@@ -849,8 +907,18 @@ function fire(kind, session, agent) {
   execFileSync("node", agent ? [hook, kind, "--agent", agent] : [hook, kind], {
     input: JSON.stringify(payload),
     stdio: ["pipe", "inherit", "inherit"],
-    // Хук молчит по многим причинам сразу; пусть скажет, по какой именно.
-    env: { ...process.env, CFA_DEBUG: "1" },
+    env: {
+      ...process.env,
+      // Хук молчит по многим причинам сразу; пусть скажет, по какой именно.
+      CFA_DEBUG: "1",
+      // Алерт зовёт редактор через `open`, а тот ведёт к обычному профилю: щелчок
+      // открыл бы папку стенда рабочим окном. Своя дорога ведёт в профиль стенда.
+      CFA_OPEN: path.join(__dirname, "open-in-stand.sh"),
+      // Сокет окна достаётся хуку от того, кто его запустил, — а запускают его
+      // отсюда, из рабочего окна. С ним хук приписал бы событие стенда рабочему
+      // окну: у настоящей сессии стенда сокет был бы его собственный.
+      VSCODE_IPC_HOOK_CLI: "",
+    },
   });
   console.log(`хук отработал: ${kind}${agent ? ` (${agent})` : ""}`);
 }
@@ -1585,13 +1653,19 @@ async function main() {
       forget();
       break;
     case "press":
-      await press(rest[0] || path.join(__dirname, "vscode-user"), rest[1] || path.join(__dirname, "vscode-ext"));
+      await press();
+      break;
+    case "prefer":
+      prefer(rest[0] === "panel" ? "panel" : "editor");
       break;
     case "open-tab":
       openTab(rest[0], rest[1] || path.join(__dirname, "vscode-user"), rest[2] || path.join(__dirname, "vscode-ext"));
       break;
     case "landed":
-      await landed(rest[0], rest[1] || "sidebar", Number(rest[2]) || 8);
+      // Третьим словом — было ли откуда выводить окно вперёд: «away» значит,
+      // что редактора на экране не было вовсе.
+      mustBeInFront = rest[2] !== "away";
+      await landed(rest[0], rest[1] || "sidebar", 8);
       break;
     default:
       console.error(

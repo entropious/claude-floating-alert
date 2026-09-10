@@ -685,6 +685,27 @@ function about(what, fallback, read) {
 /** What went wrong while this alert was being put together. */
 let troubles = [];
 
+/**
+ * Throw away requests left for windows that are gone. A window takes its own
+ * away when it starts, but one that never comes back leaves its file lying
+ * there for the pid to come round again.
+ */
+function sweepAsks() {
+  let names = [];
+  try {
+    names = fs.readdirSync(ASK_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const pid = Number(path.basename(name, ".json"));
+    if (pid && isAlive(pid)) continue;
+    try {
+      fs.unlinkSync(path.join(ASK_DIR, name));
+    } catch {}
+  }
+}
+
 function main(kind, input, agent) {
   const cwd = input.cwd || "";
   const session = input.session_id;
@@ -715,15 +736,19 @@ function main(kind, input, agent) {
   // it is said separately, and to that window by name. The window is named by
   // the process of its extension host, which is what watches for the request.
   const target = about("which window holds the chat", 0, () => askWindow(cwd, session));
+  about("which requests are stale", null, sweepAsks);
   const askFile = target ? path.join(ASK_DIR, `${target}.json`) : "";
   const click = target
     ? JSON.stringify({ action: "reveal", agent, session: session || "", tab: inTab })
     : "";
 
-  // The link says the same thing to whichever window VS Code hands it to, and
-  // is what is left when no window could be named — a chat whose window has not
-  // published itself, or none at all. Sent only where some window has the folder
-  // open: a link nobody claims makes VS Code open an empty window for it.
+  // The link is the way in when no window could be named. It is not sent
+  // alongside a request: VS Code hands a link to the window it likes, brings
+  // that one forward to receive it, and the window just raised for the chat
+  // loses the front again — to the very window the user was leaving.
+  //
+  // And only where some window has the folder open: a link nobody claims makes
+  // VS Code open an empty window for it.
   const link =
     !target && windowsFor(cwd).length
       ? `${REVEAL_URL}?${new URLSearchParams({

@@ -132,6 +132,8 @@ final class Controller: NSObject {
     private let opts: Options
     private var panel: AlertPanel!
     private var dismissTimer: Timer?
+    /// Kept alive for as long as the panel is: a signal source stops on release.
+    private var presses: [DispatchSourceSignal] = []
 
     private let width: CGFloat = 450
     /// An alert that closes itself needs no button; one that waits for an answer
@@ -722,24 +724,22 @@ final class Controller: NSObject {
         }
     }
 
-    /// Raise the window holding the folder, then hand it the deep link — that
-    /// order is what makes the link land in the right window.
+    /// Bring the window holding the chat forward, and tell it what to show.
     ///
-    /// Both go through `open`, which reuses the window that already has the
-    /// folder; launching the app with the folder as an argument would open a
-    /// second window for it instead.
+    /// The folder is what names the window, and the editor's own command line is
+    /// what raises it: handing the folder to `open` asks the system to open a
+    /// document, and with that folder already open in a background window the
+    /// app comes forward on whatever window was in front — which is the window
+    /// the user is leaving, not the one the alert is about.
     private func openTarget() {
         // The window is told what to show before it is raised: it watches for
         // the request either way, and this way the chat is already coming up as
         // the window arrives.
         ask(opts.askClick)
-        if opts.folder.isEmpty {
-            // Nothing to raise by folder: activate the app itself, which brings
-            // its existing windows forward without opening one.
-            runOpen(["-b", opts.bundleID])
-        } else {
-            runOpen(["-b", opts.bundleID, opts.folder])
-        }
+        if !opts.folder.isEmpty { raiseUntilFront(opts.folder) }
+        // Which app: whatever window the editor now has in front is the one that
+        // comes up with it, which is why this goes last.
+        runOpen(["-b", opts.bundleID])
         guard !opts.url.isEmpty else { return }
         // `open` returns before the window is actually in front, and a link
         // arriving too early finds no window to belong to — VS Code then opens
@@ -747,6 +747,70 @@ final class Controller: NSObject {
         // nothing when it already is, which is the common case for a click.
         waitUntilFront()
         runOpen([opts.url])
+    }
+
+    /// Ask for the window until it says it is in front.
+    ///
+    /// One request is not enough: an editor busy with a window switch of its
+    /// own drops it, and a click right after leaving that window is exactly
+    /// when it is busy. Whether it worked is knowable — every window publishes
+    /// its focus for the hook to read, and so can this.
+    private func raiseUntilFront(_ folder: String) {
+        for _ in 0..<4 {
+            raise(folder)
+            let until = Date().addingTimeInterval(0.4)
+            while Date() < until {
+                if windowInFront(folder) { return }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
+    }
+
+    /// Whether a window holding this folder says it has focus.
+    private func windowInFront(_ folder: String) -> Bool {
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/floating-alert/focus")
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return false }
+        for name in names {
+            let file = (dir as NSString).appendingPathComponent(name)
+            guard
+                let data = FileManager.default.contents(atPath: file),
+                let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                state["focused"] as? Bool == true,
+                let folders = state["folders"] as? [String]
+            else { continue }
+            if folders.contains(where: { folder == $0 || folder.hasPrefix("\($0)/") }) { return true }
+        }
+        return false
+    }
+
+    /// Bring the window holding this folder forward.
+    private func raise(_ folder: String) {
+        // A stand names its own way in, and going around it would reach the
+        // editor the user runs instead of the one being tested.
+        if ProcessInfo.processInfo.environment["CFA_OPEN"] == nil, let cli = editorCommandLine() {
+            runEditor(cli, [folder])
+            return
+        }
+        runOpen(["-b", opts.bundleID, folder])
+    }
+
+    /// The editor's own command line, which talks to the running instance and
+    /// raises the window of a folder it already has open. Absent for an editor
+    /// installed somewhere unusual, and then `open` has to do.
+    private func editorCommandLine() -> String? {
+        guard
+            let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: opts.bundleID)
+        else { return nil }
+        let cli = app.appendingPathComponent("Contents/Resources/app/bin/code").path
+        return FileManager.default.isExecutableFile(atPath: cli) ? cli : nil
+    }
+
+    private func runEditor(_ program: String, _ arguments: [String]) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: program)
+        task.arguments = arguments
+        try? task.run()
+        task.waitUntilExit()
     }
 
     /// Blocks until the editor is the frontmost app, or until the wait has gone
@@ -759,12 +823,38 @@ final class Controller: NSObject {
         }
     }
 
+    /// Hand a folder or a link to the editor.
+    ///
+    /// `open` talks to the editor the system knows, which is the one the user
+    /// runs. A debug stand runs its own copy on its own profile and would never
+    /// be reached that way, so `CFA_OPEN` may name what to run instead — same
+    /// arguments, a different way in. Nothing but the stand sets it.
     private func runOpen(_ arguments: [String]) {
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        let opener = ProcessInfo.processInfo.environment["CFA_OPEN"] ?? "/usr/bin/open"
+        task.executableURL = URL(fileURLWithPath: opener)
         task.arguments = arguments
         try? task.run()
         task.waitUntilExit()
+    }
+
+    /// Do what a click does, without one.
+    ///
+    /// A mouse click on this panel cannot be sent by a test: posting one needs
+    /// accessibility rights a run does not have. These two signals run the very
+    /// code a click runs, so what is checked is the panel's own behaviour and
+    /// not a copy of it.
+    func listenForPress() {
+        for (number, act) in [(SIGUSR1, #selector(runAction)), (SIGUSR2, #selector(accept))] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                _ = self.perform(act)
+            }
+            source.resume()
+            presses.append(source)
+        }
     }
 
     @objc private func dismiss() {
@@ -787,4 +877,5 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let controller = Controller(opts: options)
 controller.show()
+controller.listenForPress()
 app.run()

@@ -51,6 +51,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeFloatingAlert.toggleHooks", toggleHooks),
     vscode.commands.registerCommand("claudeFloatingAlert.test", showTestAlert),
+    vscode.commands.registerCommand("claudeFloatingAlert.showLog", showLog),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("claudeFloatingAlert")) writeRuntimeConfig();
     }),
@@ -381,6 +382,23 @@ async function toggleHooks(): Promise<void> {
     vscode.window.showErrorMessage(`Claude Floating Alert: could not update settings.json — ${error}`);
   }
   refreshStatus();
+}
+
+/**
+ * Open the log the hook keeps: one line per event, with the windows and reports
+ * the decision was made on. An alert that fired when it should not have, or
+ * never came, is explained by nothing else.
+ */
+async function showLog(): Promise<void> {
+  const file = path.join(INSTALL_DIR, "log.jsonl");
+  if (!fs.existsSync(file)) {
+    vscode.window.showInformationMessage(
+      "Claude Floating Alert: no events yet — the log is written as they arrive."
+    );
+    return;
+  }
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+  await vscode.window.showTextDocument(document, { preview: false });
 }
 
 function showTestAlert(): void {
