@@ -384,20 +384,18 @@ function surfacesOf(sessionId, all) {
 }
 
 /**
- * Whether the window of one extension host has focus. Two files carry the same
- * flag, both written by that host, and what differs is when. Ours is written on
- * the focus change itself, so it is never behind; the report of a patched
- * Claude Code is written on chat events, and going to another window is not
- * one — it keeps saying "focused" until that chat is touched again.
+ * Whether the window of one extension host has focus.
  *
- * So ours answers wherever it exists, and the report answers for a window our
- * extension has not run in.
+ * Only our own file answers this. The report of a patched Claude Code carries
+ * the same flag, but writes it on chat events, and leaving for another window
+ * is not one: it goes on saying "focused" until that chat is touched again, and
+ * believing it is how an alert gets swallowed for a window nobody is looking
+ * at. A window with no file of ours is not known to be in front, and silence
+ * needs certainty.
  */
 function windowFocused(pid) {
   const state = windowState(pid);
-  if (state) return !!state.focused;
-  const report = presenceOf(pid);
-  return report ? !!report.focused : false;
+  return state ? !!state.focused : false;
 }
 
 /**
@@ -542,9 +540,11 @@ function sessionIsWatched(cwd, sessionId, agent) {
   const own = (window.chatTabs || []).filter((label) => tabBelongs(label, marks));
   // The chat is open as a tab: only the tab on top is in front of the user.
   if (own.length > 0) return own.includes(window.activeChat);
-  // Otherwise the chat lives in the side bar, which the tab API cannot see —
-  // the focused window is the best signal there is.
-  return true;
+  // Otherwise the chat is taken to live in the side bar, which no API can see
+  // into, and a focused window stands for it. That only holds while there is
+  // one window it could be: with the same folder open twice, the focused one
+  // may be the other, and the side bar in front may be showing another chat.
+  return windowsFor(cwd).length === 1;
 }
 
 /** The view containers Codex puts its panel in, as the layout state names them. */
@@ -647,6 +647,7 @@ function record(kind, input, agent) {
       tool: input.tool_name || "",
       hookWindow: WINDOW_ID,
       outcome: outcome || "alert",
+      troubles,
       windows,
     });
     let kept = [];
@@ -659,6 +660,31 @@ function record(kind, input, agent) {
   } catch {}
 }
 
+/**
+ * Work out one thing about the editor, and never let it cost the alert.
+ *
+ * Everything read here comes from files other processes write — windows,
+ * reports, transcripts, the layout database — and a surprise in any of them
+ * used to take the whole panel down with it: the run threw, the throw was
+ * swallowed at the top, and the event passed in silence. An alert with a
+ * missing detail is still an alert; no alert is a missed turn.
+ */
+function about(what, fallback, read) {
+  try {
+    return read();
+  } catch (error) {
+    const trouble = `could not tell ${what}: ${error}`;
+    explain(trouble);
+    // Said on the panel too: a detail quietly missing is how an alert starts
+    // leading to the wrong place, and nobody reads a log they do not suspect.
+    troubles.push(trouble);
+    return fallback;
+  }
+}
+
+/** What went wrong while this alert was being put together. */
+let troubles = [];
+
 function main(kind, input, agent) {
   const cwd = input.cwd || "";
   const session = input.session_id;
@@ -668,20 +694,27 @@ function main(kind, input, agent) {
   if (!config) return explain(`unknown kind ${kind}`);
   if (!fs.existsSync(BINARY)) return explain("no alert binary installed");
 
-  if (sessionIsWatched(cwd, session, agent)) return explain("the chat is in front of the user");
+  // Silence needs certainty; anything short of it raises the alert.
+  if (about("whether the chat is watched", false, () => sessionIsWatched(cwd, session, agent))) {
+    return explain("the chat is in front of the user");
+  }
 
   // A self-closing panel must not replace one that waits for an answer.
-  const previous = livePanel(session);
+  const previous = about("what is already on screen", null, () => livePanel(session));
   if (previous && BLOCKING.has(previous.kind) && !BLOCKING.has(kind)) {
     return explain(`a ${previous.kind} alert is still waiting for an answer`);
   }
 
   const { subtitle, title, body } = compose(kind, input, agent);
-  const inTab = agent !== "codex" && sessionIsInTab(cwd, session);
+  const inTab = about(
+    "which surface holds the chat",
+    false,
+    () => agent !== "codex" && sessionIsInTab(cwd, session)
+  );
   // The folder raises the window that has it open; what to bring forward inside
   // it is said separately, and to that window by name. The window is named by
   // the process of its extension host, which is what watches for the request.
-  const target = askWindow(cwd, session);
+  const target = about("which window holds the chat", 0, () => askWindow(cwd, session));
   const askFile = target ? path.join(ASK_DIR, `${target}.json`) : "";
   const click = target
     ? JSON.stringify({ action: "reveal", agent, session: session || "", tab: inTab })
@@ -720,7 +753,7 @@ function main(kind, input, agent) {
     [
       "--subtitle", subtitle,
       "--title", title,
-      "--body", body,
+      "--body", [body, ...troubles].filter(Boolean).join("\n⚠ "),
       "--accent", config.accent,
       "--timeout", String(config.timeout),
       "--folder", windowFolder(cwd, session),
@@ -728,12 +761,38 @@ function main(kind, input, agent) {
       "--ask-file", askFile,
       "--ask-click", click,
       "--ask-accept", accept,
+      // The way to the whole story, offered only when there is one to tell.
+      "--log-file", troubles.length > 0 ? LOG_FILE : "",
       "--bundle-id", VSCODE_BUNDLE_ID,
     ],
     { detached: true, stdio: "ignore" }
   );
   child.unref();
   rememberPanel(session, child.pid, cwd, kind, agent);
+}
+
+/**
+ * The last resort: a panel with nothing on it but what went wrong. No windows
+ * are consulted and no link is offered — whatever was needed for those is what
+ * just failed.
+ */
+function cryOut(kind, agent, error) {
+  try {
+    spawn(
+      BINARY,
+      [
+        "--subtitle", AGENTS[agent] || AGENTS.claude,
+        "--title", `${AGENTS[agent] || AGENTS.claude}: ${kind || "event"}`,
+        "--body", `The alert could not be put together — ${error}`,
+        "--accent", "red",
+        "--timeout", "0",
+        "--bundle-id", VSCODE_BUNDLE_ID,
+      ],
+      { detached: true, stdio: "ignore" }
+    ).unref();
+  } catch {
+    /* nothing left to try: the binary itself is what could not be started */
+  }
 }
 
 let raw = "";
@@ -750,6 +809,10 @@ process.stdin.on("end", () => {
     main(kind, input, agent);
   } catch (error) {
     explain(`the hook itself failed: ${error}`);
+    // Whatever broke, the event still happened and the user is still waiting.
+    // A bare panel saying so beats the silence that a swallowed error used to
+    // leave — the agent is stopped either way, and nobody watches a log.
+    cryOut(kind, agent, String(error));
   }
   record(kind, input, agent);
   process.exit(0);

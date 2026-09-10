@@ -12,6 +12,7 @@
 //   claude-alert --title "..." --body "..." [--subtitle "..."] [--accent orange]
 //                [--timeout 0] [--folder /path] [--url vscode://…]
 //                [--ask-file /path] [--ask-click json] [--ask-accept json]
+//                [--log-file /path]
 //                [--bundle-id id]
 
 import AppKit
@@ -35,6 +36,9 @@ struct Options {
     var askFile = ""
     var askClick = ""
     var askAccept = ""
+    /// Log to open from the panel. Handed over only when something went wrong
+    /// putting the alert together, and then the panel offers a way to see what.
+    var logFile = ""
     var bundleID = "com.microsoft.VSCode"
 }
 
@@ -59,6 +63,7 @@ func parseArgs() -> Options {
         case "--ask-file": o.askFile = take()
         case "--ask-click": o.askClick = take()
         case "--ask-accept": o.askAccept = take()
+        case "--log-file": o.logFile = take()
         case "--bundle-id": o.bundleID = take()
         case "--timeout": o.timeout = Double(take()) ?? 0
         default: break
@@ -66,6 +71,10 @@ func parseArgs() -> Options {
     }
     return o
 }
+
+/// How the hook marks a line about what went wrong while the alert was put
+/// together, so the panel can tell those from the event itself.
+let TROUBLE_MARK = "\u{26A0} "
 
 func accentColor(_ name: String) -> NSColor {
     switch name {
@@ -130,6 +139,8 @@ final class Controller: NSObject {
     private var hasClose: Bool { opts.timeout <= 0 }
     /// Only where something on the other side can answer the request.
     private var hasAccept: Bool { !opts.askFile.isEmpty && !opts.askAccept.isEmpty }
+    /// Only where the alert has something to explain.
+    private var hasLog: Bool { !opts.logFile.isEmpty }
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
     /// Whether the whole command is on screen, or only its first lines.
     private var expanded = false
@@ -182,7 +193,7 @@ final class Controller: NSObject {
         stripe.layer?.backgroundColor = accent.cgColor
         stripe.translatesAutoresizingMaskIntoConstraints = false
 
-        let accept = hasAccept ? acceptButton() : nil
+        let accept = buttonsRow()
         // The button hangs over the bottom-right corner of the body, which flows
         // around it: only the last lines are cut short, the ones above keep the
         // full width. Without a body there is nothing to flow, and the button
@@ -394,6 +405,51 @@ final class Controller: NSObject {
         )
     }
 
+    /// The row of answers along the bottom: what went wrong, and what can be
+    /// done about the request without leaving what you are doing.
+    private func buttonsRow() -> NSView? {
+        var buttons: [NSView] = []
+        if hasLog { buttons.append(logButton()) }
+        if hasAccept { buttons.append(acceptButton()) }
+        guard !buttons.isEmpty else { return nil }
+        let row = NSStackView(views: buttons)
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
+    /// Opens the log of the hook, where the whole event is written down: what
+    /// the alert says about the trouble is one line of it.
+    private func logButton() -> NSButton {
+        let button = NSButton()
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        button.title = "Log"
+        button.font = .systemFont(ofSize: 13, weight: .semibold)
+        button.image = NSImage(
+            systemSymbolName: "doc.text.magnifyingglass",
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
+        button.imagePosition = .imageLeading
+        button.target = self
+        button.action = #selector(showLog)
+        button.toolTip = opts.logFile
+        return button
+    }
+
+    /// Hands the log to the editor and goes away. Nothing is revealed and no
+    /// request is answered: the point is to see what happened.
+    @objc private func showLog() {
+        let file = opts.logFile
+        let bundle = opts.bundleID
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.runOpen(["-b", bundle, file])
+        }
+        dismiss()
+    }
+
     /// Answers the request from here: the link picks the first option in the
     /// chat, and the panel goes away without anything coming to the front.
     private func acceptButton() -> NSButton {
@@ -435,18 +491,36 @@ final class Controller: NSObject {
     /// prose and stays one colour.
     private func bodyText() -> NSAttributedString {
         let font = NSFont.systemFont(ofSize: 12)
+        // What went wrong is marked by the hook and comes after the event
+        // itself; it is written in the colour of trouble so that a detail
+        // missing from the alert cannot be mistaken for part of the command.
+        let lines = opts.body.components(separatedBy: "\n")
+        let said = lines.filter { !$0.hasPrefix(TROUBLE_MARK) }.joined(separator: "\n")
+        let wrong = lines.filter { $0.hasPrefix(TROUBLE_MARK) }
+
         let prefix = "Bash · "
-        guard opts.body.hasPrefix(prefix) else {
-            return NSAttributedString(
-                string: opts.body,
-                attributes: [.font: font, .foregroundColor: bodyColor]
+        let out = NSMutableAttributedString()
+        if said.hasPrefix(prefix) {
+            out.append(
+                NSAttributedString(
+                    string: prefix,
+                    attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+                )
+            )
+            out.append(highlighted(String(said.dropFirst(prefix.count))))
+        } else {
+            out.append(
+                NSAttributedString(string: said, attributes: [.font: font, .foregroundColor: bodyColor])
             )
         }
-        let out = NSMutableAttributedString(
-            string: prefix,
-            attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
-        )
-        out.append(highlighted(String(opts.body.dropFirst(prefix.count))))
+        for line in wrong {
+            out.append(
+                NSAttributedString(
+                    string: "\n\(line)",
+                    attributes: [.font: font, .foregroundColor: NSColor.systemRed]
+                )
+            )
+        }
         return out
     }
 
