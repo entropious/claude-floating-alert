@@ -494,8 +494,14 @@ function askWindow(cwd, sessionId) {
 function sessionIsInTab(cwd, sessionId) {
   const reported = surfacesOf(sessionId);
   if (reported.length > 0) {
-    // A session can sit in a tab and in the side bar at once. The link has to
-    // name the one the user last worked in, not whichever exists.
+    // A session can sit in a tab and in the side bar at once, and then the tab
+    // on top of its window is where it is being worked in. That comes first
+    // because the times cannot settle it: every surface of a window is stamped
+    // in the same write, so a session showing in both has the same moment
+    // against each — and the winner would be whichever the report lists first,
+    // which is a side bar.
+    if (reported.some((surface) => surface.kind === "tab" && surface.active)) return true;
+    // Otherwise the one worked in last, where those do differ.
     const latest = reported.reduce((best, surface) =>
       (surface.activeAt || 0) > (best.activeAt || 0) ? surface : best
     );

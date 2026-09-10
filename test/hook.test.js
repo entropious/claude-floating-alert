@@ -310,6 +310,17 @@ test("stays quiet for a session the report never mentions", () => {
   assert.strictEqual(args, null, "an unmentioned session falls back to the window, not to an alert");
 });
 
+test("aims at the tab on top when the side bar holds the same session", () => {
+  const args = runHook("permission", {
+    focused: false,
+    presence: [
+      { session: SESSION, kind: "sidebar", chat: true, visible: true, active: true, activeAt: 5 },
+      { session: SESSION, kind: "tab", chat: true, visible: true, active: true, activeAt: 5 },
+    ],
+  });
+  assert.match(flag(args, "--ask-click"), /"tab":true/, "the tab on top is where the work is");
+});
+
 test("links to the surface the session was last worked in", () => {
   const args = runHook("stop", {
     focused: true,
