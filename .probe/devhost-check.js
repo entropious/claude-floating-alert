@@ -255,15 +255,39 @@ function openTab(session, profile, extensions) {
   console.log(`вкладкой открыта сессия ${session.slice(0, 8)}`);
 }
 
+/**
+ * Не щелчок, а его повторение: из аргументов висящей панели берётся то, с чем
+ * её позвали, и проделывается ровно то же, что сделал бы её код, — просьба
+ * окну, потом само окно вперёд. Проверяется этим не панель, а то, что ей
+ * передал хук.
+ *
+ * Настоящим щелчком это не сделать. Мышью — нужны права Accessibility, которых
+ * у прогона нет; изнутри панели — она зовёт `open -b com.microsoft.VSCode`, то
+ * есть обычный редактор с рабочим профилем, и папка стенда открылась бы новым
+ * окном не там, где идёт прогон.
+ */
 async function press(profile, extensions) {
   const line = alertLines()[0];
   if (!line) {
     console.error("на экране нет алерта, нажимать нечего");
     process.exit(1);
   }
+  // Просьба адресована окну по имени файла, и это главный путь; ссылка остаётся
+  // на случай, когда окна для события не нашлось.
+  const askFile = (line.match(/--ask-file (\S+)/) || [])[1];
+  const click = (line.match(/--ask-click (\{.*?\}) --/) || [])[1];
+  if (askFile && click) {
+    fs.mkdirSync(path.dirname(askFile), { recursive: true });
+    fs.writeFileSync(askFile, click);
+    spawnSync(CODE_CLI, [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`, workspace()], {
+      encoding: "utf-8",
+    });
+    spawnSync("pkill", ["-f", "floating-alert/bin/claude-alert"]);
+    return console.log(`нажат алерт: ${click}`);
+  }
   const url = (line.match(/--url (\S+)/) || [])[1];
   if (!url) {
-    console.error("у алерта нет ссылки");
+    console.error("у алерта нет ни просьбы, ни ссылки");
     process.exit(1);
   }
   // Сперва поднимается окно папки, и лишь потом идёт ссылка — тем же порядком,
@@ -293,7 +317,21 @@ async function press(profile, extensions) {
  * Куда привёл щелчок: ждём, пока сессия окажется на экране, и говорим, в какой
  * поверхности. Ожидание короткое — окно уже поднято, речь про одну команду.
  */
-function landed(session, kind, seconds) {
+/**
+ * При честном фокусе щелчок обязан ещё и вывести вперёд окно события: в
+ * подделке этого не проверить — фокус там назначается файлом.
+ */
+function windowInFront() {
+  let mode = "pretend";
+  try {
+    mode = fs.readFileSync(path.join(__dirname, "focus-mode"), "utf-8").trim();
+  } catch {}
+  if (mode !== "real") return true;
+  return !!(standWindow() || {}).focused;
+}
+
+async function landed(session, kind, seconds) {
+  if (!reporting()) return landedPlain(session, kind, seconds || 8);
   for (let waited = 0; waited < (seconds || 8) * 1000; waited += 250) {
     for (const state of readAll(path.join(ROOT, "presence"))) {
       if (!alive(state.pid)) continue;
@@ -308,7 +346,7 @@ function landed(session, kind, seconds) {
           surface.visible &&
           surface.active
       );
-      if (found) return console.log(`  ok  щелчок открыл ${kind}`);
+      if (found && windowInFront()) return console.log(`  ok  щелчок открыл ${kind}`);
     }
     pause(250);
   }
@@ -320,6 +358,82 @@ function landed(session, kind, seconds) {
     }
   }
   process.exitCode = 1;
+}
+
+/** Отчитывается ли о чатах кто-нибудь в окне стенда. */
+function reporting() {
+  return readAll(path.join(ROOT, "presence")).some(
+    (state) => alive(state.pid) && (state.folders || []).includes(workspace())
+  );
+}
+
+/**
+ * Куда привёл щелчок на непропатченном Claude Code, где о поверхностях не
+ * отчитывается никто.
+ *
+ * Панель видно по разметке окна. Вкладку — по ярлыку: окно публикует тот, что
+ * сейчас поверх, а сам ярлык Claude Code берёт из первого сообщения чата, и по
+ * нему вкладка сходится со своей сессией — тем же способом, каким это делает
+ * сам хук, когда отчётов нет.
+ */
+async function landedPlain(session, kind, seconds) {
+  for (let waited = 0; waited < seconds * 1000; waited += 250) {
+    if (kind === "sidebar") {
+      if ((await chatBarShown()) && windowInFront()) return console.log("  ok  щелчок открыл sidebar");
+    } else {
+      if (tabHolds(session) && windowInFront()) return console.log("  ok  щелчок открыл tab");
+    }
+    pause(250);
+  }
+  console.log(`FAIL  щелчок не открыл ${kind} для ${session.slice(0, 8)}`);
+  console.log(`      поверх редактора: ${(standWindow() || {}).activeChat || "не чат"}`);
+  process.exitCode = 1;
+}
+
+/**
+ * Держит ли вкладка поверх редактора именно эту сессию.
+ *
+ * Ярлык вкладки Claude Code сочиняет сам по первому сообщению чата — «напиши
+ * слово два» становится «Слово два», — поэтому сравнивать их целиком нельзя.
+ * Сходится по словам: все слова ярлыка должны найтись в первом сообщении, и
+ * этого хватает, чтобы отличить чаты стенда друг от друга.
+ */
+function tabHolds(session) {
+  const label = ((standWindow() || {}).activeChat || "").trim().toLowerCase();
+  if (!label) return false;
+  const first = firstMessage(session).toLowerCase();
+  if (!first) return false;
+  return label
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((word) => word.length > 2)
+    .every((word) => first.includes(word));
+}
+
+/** Первое сообщение чата — то, из чего Claude Code делает ярлык его вкладки. */
+function firstMessage(session) {
+  const file = path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    workspace().replace(/[/.]/g, "-"),
+    `${session}.jsonl`
+  );
+  try {
+    for (const line of fs.readFileSync(file, "utf-8").split("\n")) {
+      if (!line.includes('"type":"user"')) continue;
+      const content = JSON.parse(line).message.content;
+      if (typeof content === "string") return content;
+      // Сообщение приходит и списком кусков — текст тогда лежит в них.
+      if (Array.isArray(content)) {
+        return content
+          .map((piece) => (piece && typeof piece.text === "string" ? piece.text : ""))
+          .join(" ")
+          .trim();
+      }
+      return "";
+    }
+  } catch {}
+  return "";
 }
 
 function forget() {
@@ -539,8 +653,13 @@ function expected(session) {
   console.log(best ? best.kind : "нет");
 }
 
-/** Видна ли сейчас боковая панель с чатом — по её же отчёту. */
-function panel() {
+/**
+ * Видна ли сейчас боковая панель с чатом. Отчёт поверхностей отвечает точно, но
+ * на непропатченном Claude Code его нет вовсе — а прогонять сценарии надо и
+ * там. Тогда отвечает сама разметка окна: чат в боковой полосе — это её живой
+ * контейнер с вебвью Claude Code внутри.
+ */
+async function panel() {
   for (const state of readAll(path.join(ROOT, "presence"))) {
     if (!alive(state.pid) || !(state.folders || []).includes(workspace())) continue;
     const shown = (state.surfaces || []).some(
@@ -548,7 +667,82 @@ function panel() {
     );
     return console.log(shown ? "видима" : "скрыта");
   }
-  console.log("нет отчёта");
+  console.log((await chatBarShown()) ? "видима" : "скрыта");
+}
+
+/**
+ * Тот же вопрос, но по разметке окна: стоит ли сейчас в какой-нибудь боковой
+ * полосе чат Claude Code.
+ *
+ * Смотреть надо на заголовок полосы, а не на её содержимое: разметка вида
+ * остаётся в дереве и скрытой, а вот подпись полосы всегда называет тот
+ * контейнер, который в ней сейчас выбран, и у скрытой полосы её нет вовсе.
+ */
+async function chatBarShown() {
+  const target = await workbenchTarget();
+  return !!(await evaluate(target.webSocketDebuggerUrl, `(${barsProbe})("shown")`));
+}
+
+/** Разметка боковых полос глазами окна: что в них выбрано и видно ли их. */
+const barsProbe = function (mode) {
+  const seen = [];
+  for (const part of document.querySelectorAll(".part.sidebar, .part.auxiliarybar")) {
+    const style = getComputedStyle(part);
+    const hidden = style.display === "none" || style.visibility === "hidden" || part.offsetWidth === 0;
+    const title = part.querySelector(".composite.title .title-label, .composite.title h2");
+    const label = (title ? title.textContent : "").trim();
+    seen.push({ part: part.className, hidden, width: part.offsetWidth, label });
+  }
+  seen.push({ workbench: (document.querySelector(".monaco-workbench") || {}).className || "" });
+  if (mode === "hide") {
+    // Закрывается та полоса, в которой стоит чат, и её же средствами: у
+    // вторичной для этого есть крестик в заголовке, а первичная закрывается
+    // повторным щелчком по своей же иконке в activity bar. Команды палитры
+    // тут не годятся — какая из них какую полосу переключает, от сборки к
+    // сборке разное.
+    const closed = [];
+    for (const part of document.querySelectorAll(".part.sidebar, .part.auxiliarybar")) {
+      const bar = seen.find((entry) => entry.part === part.className);
+      if (!bar || bar.hidden || !/claude/i.test(bar.label)) continue;
+      if (/auxiliarybar/.test(part.className)) {
+        const close = part.querySelector('.composite.title [class*="auxiliarybar-close"]');
+        if (close) {
+          close.click();
+          closed.push("auxiliary");
+        }
+      } else {
+        const active = document.querySelector(".activitybar .action-item.checked .action-label");
+        if (active) {
+          active.click();
+          closed.push("primary");
+        }
+      }
+    }
+    return closed.join(" ");
+  }
+  if (mode === "all") return JSON.stringify(seen, null, 1);
+  const chat = seen.filter((bar) => bar.part && !bar.hidden && /claude/i.test(bar.label));
+  if (mode === "which") return chat.map((bar) => (/auxiliarybar/.test(bar.part) ? "auxiliary" : "primary")).join(" ");
+  return chat.length > 0;
+}.toString();
+
+/**
+ * Убрать чат с боковых полос: та, что его показывает, закрывается.
+ *
+ * Какая команда какую полосу переключает — вопрос не праздный: имена в палитре
+ * и части разметки называются по-разному, и промах отдал бы обратный ход. Так
+ * что команда проверяется по факту: не помогла — идёт вторая.
+ */
+async function hideChatBars() {
+  const target = await workbenchTarget();
+  const which = () => evaluate(target.webSocketDebuggerUrl, `(${barsProbe})("which")`);
+  for (let tries = 0; tries < 6; tries++) {
+    if (!(await which())) return console.log("панель: скрыта");
+    await evaluate(target.webSocketDebuggerUrl, `(${barsProbe})("hide")`);
+    pause(400);
+  }
+  console.log(`панель: видима (${await which()})`);
+  process.exitCode = 1;
 }
 
 /** Окно стенда, каким оно себя опубликовало. */
@@ -736,14 +930,19 @@ function pretend(active) {
     console.error("окно стенда не найдено: bash .probe/devhost.sh start");
     process.exit(1);
   }
-  fs.writeFileSync(mine.file, JSON.stringify({ ...mine.state, focused }));
+  // Со свежей отметкой времени: расширение пишет её на каждом своём событии, и
+  // подделка со старой выглядела бы записью, которую все прочие уже обогнали.
+  fs.writeFileSync(mine.file, JSON.stringify({ ...mine.state, focused, at: new Date().toISOString() }));
   // Фокус один на всех: раз это окно вышло вперёд, остальные окна стенда ушли
   // назад. Иначе активными числились бы оба, и какое ответит на событие —
   // вопрос порядка файлов, а не того, куда смотрит пользователь.
   if (focused) {
     for (const entry of files) {
       if (entry.mine || !isStand(entry.state)) continue;
-      fs.writeFileSync(entry.file, JSON.stringify({ ...entry.state, focused: false }));
+      fs.writeFileSync(
+        entry.file,
+        JSON.stringify({ ...entry.state, focused: false, at: new Date().toISOString() })
+      );
     }
   }
   console.log(`окно ${path.basename(workspace())} числится ${focused ? "активным" : "фоновым"}`);
@@ -878,7 +1077,45 @@ function sessionOf(kind, other) {
     );
     if (found) return found.session;
   }
-  return "";
+  return sessionFromTranscript(other);
+}
+
+/**
+ * Сессия чата на непропатченном Claude Code: о поверхностях там не отчитывается
+ * никто, и единственный след свежего чата — стенограмма, которую он заводит на
+ * папку окна. Берётся самая свежая и только что написанная: в той же папке
+ * лежат чаты прошлых прогонов.
+ *
+ * Вид чата — панель это или вкладка — отсюда не виден, и знать его не нужно:
+ * сценарии заводят их по очереди и передают уже известную сессию в `other`,
+ * так что «свежая, но не эта» и есть вторая из них.
+ */
+function sessionFromTranscript(other) {
+  const dir = path.join(os.homedir(), ".claude", "projects", workspace().replace(/[/.]/g, "-"));
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return "";
+  }
+  let session = "";
+  let latest = Date.now() - 120000;
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue;
+    const id = name.slice(0, -".jsonl".length);
+    if (id === other) continue;
+    let stat;
+    try {
+      stat = fs.statSync(path.join(dir, name));
+    } catch {
+      continue;
+    }
+    if (stat.mtimeMs > latest) {
+      latest = stat.mtimeMs;
+      session = id;
+    }
+  }
+  return session;
 }
 
 /**
@@ -928,13 +1165,22 @@ function waitCodex(seconds) {
 
 /** Дождаться, пока поверхность нужного вида появится в окне: вкладка чата
  *  открывается не мгновенно, а печатать в неё сразу некуда. */
-function waitSurface(kind, seconds) {
+async function waitSurface(kind, seconds) {
   for (let waited = 0; waited < seconds * 1000; waited += 250) {
     for (const state of readAll(path.join(ROOT, "presence"))) {
       if (!alive(state.pid) || !(state.folders || []).includes(workspace())) continue;
       if ((state.surfaces || []).some((surface) => surface.kind === kind && surface.chat !== false)) {
         return console.log(`${kind} на месте`);
       }
+    }
+    // Без отчётов вкладку видно по окну — их публикует само расширение, —
+    // а панель по разметке.
+    if (!reporting()) {
+      const shown =
+        kind === "tab"
+          ? ((standWindow() || {}).chatTabs || []).length > 0
+          : await chatBarShown();
+      if (shown) return console.log(`${kind} на месте`);
     }
     pause(250);
   }
@@ -1292,7 +1538,7 @@ async function main() {
       await ask(rest.slice(1).join(" ") || "ответь одним словом: ok", rest[0] || "claude");
       break;
     case "wait-surface":
-      waitSurface(rest[0] || "tab", Number(rest[1]) || 5);
+      await waitSurface(rest[0] || "tab", Number(rest[1]) || 5);
       break;
     case "wait-session":
       waitSession(rest[0] || "sidebar", Number(rest[1]) || 10, rest[2]);
@@ -1316,7 +1562,15 @@ async function main() {
       await unlockGroup();
       break;
     case "panel":
-      panel();
+      await panel();
+      break;
+    case "bars": {
+      const target = await workbenchTarget();
+      console.log(await evaluate(target.webSocketDebuggerUrl, `(${barsProbe})("all")`));
+      break;
+    }
+    case "hide-chat":
+      await hideChatBars();
       break;
     case "expected":
       expected(rest[0]);
@@ -1337,7 +1591,7 @@ async function main() {
       openTab(rest[0], rest[1] || path.join(__dirname, "vscode-user"), rest[2] || path.join(__dirname, "vscode-ext"));
       break;
     case "landed":
-      landed(rest[0], rest[1] || "sidebar", Number(rest[2]) || 8);
+      await landed(rest[0], rest[1] || "sidebar", Number(rest[2]) || 8);
       break;
     default:
       console.error(

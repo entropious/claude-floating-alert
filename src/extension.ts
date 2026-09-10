@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { execFile } from "child_process";
 import {
-  ACCEPT_DIR,
+  ASK_DIR,
   BINARY,
   CONFIG_FILE,
   FOCUS_DIR,
@@ -18,7 +18,7 @@ import {
 /** Per-window socket path, shared with the terminals this window spawns. */
 const WINDOW_ID = process.env.VSCODE_IPC_HOOK_CLI || "";
 const FOCUS_FILE = path.join(FOCUS_DIR, `${process.pid}.json`);
-const ACCEPT_FILE = path.join(ACCEPT_DIR, `${process.pid}.json`);
+const ASK_FILE = path.join(ASK_DIR, `${process.pid}.json`);
 
 let statusItem: vscode.StatusBarItem;
 
@@ -63,7 +63,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.tabGroups.onDidChangeTabs(() => publishFocus(vscode.window.state.focused)),
     vscode.window.onDidChangeActiveTextEditor(() => publishFocus(vscode.window.state.focused)),
     vscode.window.tabGroups.onDidChangeTabGroups(() => publishFocus(vscode.window.state.focused)),
-    watchAccepts(),
+    watchAsks(),
     { dispose: forgetFocus }
   );
 }
@@ -153,34 +153,55 @@ function canAccept(): boolean {
   return vscode.extensions.getExtension(COLORIZER) !== undefined;
 }
 
-/**
- * Watch for the answer a clicked accept button leaves for this window, and take
- * the first option as soon as one shows up. The file is deleted before the
- * command runs, so a slow chat cannot collect two answers for one press.
- */
-function watchAccepts(): vscode.Disposable {
-  let watcher: fs.FSWatcher | undefined;
-  try {
-    fs.mkdirSync(ACCEPT_DIR, { recursive: true });
-    // A window that died with a file waiting would answer the moment it comes
-    // back, long after the request it was meant for.
-    forgetAccepts();
-    watcher = fs.watch(ACCEPT_DIR, () => {
-      if (!forgetAccepts()) return;
-      void run(ACCEPT_COMMAND);
-    });
-  } catch {}
-  return { dispose: () => { watcher?.close(); forgetAccepts(); } };
+/** What a clicked alert can ask of the window holding its chat. */
+interface Ask {
+  action?: string;
+  agent?: string;
+  session?: string;
+  tab?: boolean;
 }
 
-/** Takes this window's answer file away, saying whether there was one. */
-function forgetAccepts(): boolean {
+/**
+ * Watch for what a clicked alert leaves for this window, and do it. The file is
+ * taken away before anything runs, so a slow command cannot collect the same
+ * request twice.
+ */
+function watchAsks(): vscode.Disposable {
+  let watcher: fs.FSWatcher | undefined;
   try {
-    fs.unlinkSync(ACCEPT_FILE);
-    return true;
+    fs.mkdirSync(ASK_DIR, { recursive: true });
+    // A window that died with a request waiting would answer the moment it
+    // comes back, long after the alert it belonged to.
+    takeAsk();
+    watcher = fs.watch(ASK_DIR, () => {
+      const ask = takeAsk();
+      if (ask) void obey(ask);
+    });
+  } catch {}
+  return { dispose: () => { watcher?.close(); takeAsk(); } };
+}
+
+/** Takes this window's request away, and says what it was. */
+function takeAsk(): Ask | null {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(ASK_FILE, "utf-8");
+    fs.unlinkSync(ASK_FILE);
   } catch {
-    return false;
+    return null;
   }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function obey(ask: Ask): Promise<void> {
+  // Answering leaves everything where it is: the point of that button is to
+  // take the first option without going to the chat at all.
+  if (ask.action === "accept") return run(ACCEPT_COMMAND);
+  await reveal(ask.agent || "claude", ask.session || "", ask.tab === true);
 }
 
 /** Tell the hook script whether this window — not just VS Code — is focused. */
@@ -217,15 +238,35 @@ function isInside(cwd: string, folder: string): boolean {
 }
 
 /**
- * Bring forward the chat a clicked panel asked for. `open` can only raise the
- * window; revealing the chat tab inside it is up to the Claude Code extension,
- * whose command takes the session id.
+ * Bring forward the chat a clicked alert asked for. Raising the window is the
+ * alert's own doing; what is inside it belongs to whoever lives there.
  */
+async function reveal(agent: string, session: string, tab: boolean): Promise<void> {
+  if (agent === "codex") {
+    // Codex takes no session anywhere: its panel opens on whatever chat it was
+    // left on, which is the one the alert came from. The command reveals the
+    // container and focuses the view itself, in whichever side bar this editor
+    // puts the panel — a `<view>.focus` of our own would only be the same work
+    // again, and the one for the side bar the panel is not in costs a wait on
+    // the extension activation of a command that is missing.
+    return run("chatgpt.openSidebar");
+  }
+  if (tab) return run("claude-vscode.editor.open", session || undefined);
+  // A side bar chat has no tab to reveal, and the reveal command would open a
+  // second copy of it in the editor. The side bar command focuses its own view,
+  // so nothing else is needed here either.
+  return run("claude-vscode.sidebar.open");
+}
+
 /**
- * Handles the link a clicked panel opens: `open` can only raise the window,
- * bringing the chat itself forward is up to whoever lives inside it.
+ * Handles the link a clicked panel opens, which is the way in when the hook
+ * found no window to address by name:
  *
  *   vscode://entro.claude-floating-alert/reveal?agent=claude&session=<id>&cwd=<path>&tab=1
+ *
+ * VS Code hands the link to whichever window it likes, so the folder in it says
+ * whose chat this is about, and a window that does not hold that folder leaves
+ * the link alone.
  */
 function revealHandler(): vscode.UriHandler {
   return {
@@ -233,28 +274,8 @@ function revealHandler(): vscode.UriHandler {
       if (uri.path !== "/reveal") return;
       const query = new URLSearchParams(uri.query);
       const cwd = query.get("cwd") || "";
-      // The link lands in one window; ignore it unless the chat belongs here.
       if (!cwd || !workspacePaths().some((folder) => isInside(cwd, folder))) return;
-
-      if (query.get("agent") === "codex") {
-        // Codex takes no session anywhere: its panel opens on whatever chat it
-        // was left on, which is the one the alert came from. The command reveals
-        // the container and focuses the view itself, in whichever side bar this
-        // editor puts the panel — a `<view>.focus` of our own would only be the
-        // same work again, and the one for the side bar the panel is not in
-        // costs a wait on the extension activation of a command that is missing.
-        await run("chatgpt.openSidebar");
-        return;
-      }
-
-      if (query.get("tab") === "1") {
-        await run("claude-vscode.editor.open", query.get("session") || undefined);
-        return;
-      }
-      // A side bar chat has no tab to reveal, and the reveal command would open
-      // a second copy of it in the editor. The side bar command focuses its own
-      // view, so nothing else is needed here either.
-      await run("claude-vscode.sidebar.open");
+      await reveal(query.get("agent") || "claude", query.get("session") || "", query.get("tab") === "1");
     },
   };
 }

@@ -108,7 +108,7 @@ function runHook(kind, options, agent) {
     }),
     // The debug line is what says an alert was decided against, which is the
     // difference between "no alert" and "the alert has not started yet".
-    env: { ...process.env, HOME: home, VSCODE_IPC_HOOK_CLI: "", CFA_DEBUG: "1" },
+    env: { ...process.env, HOME: home, VSCODE_IPC_HOOK_CLI: options.windowId || "", CFA_DEBUG: "1" },
     encoding: "utf-8",
   });
   assert.strictEqual(result.status, 0, "the hook must never fail the CLI");
@@ -159,7 +159,7 @@ test("alerts when the chat tab is not the one on top", () => {
     activeChat: "some other tab",
   });
   assert.ok(args, "an alert should have been raised");
-  assert.match(flag(args, "--url"), /tab=1/, "the link should reveal the tab");
+  assert.match(flag(args, "--ask-click"), /"tab":true/, "the click should reveal the tab");
 });
 
 test("stays quiet when the chat tab is the one on top", () => {
@@ -171,9 +171,11 @@ test("stays quiet when the chat tab is the one on top", () => {
   assert.strictEqual(args, null);
 });
 
-test("links to the side bar when no tab holds the chat", () => {
+test("asks for the side bar when no tab holds the chat", () => {
   const args = runHook("stop", { focused: false });
-  assert.match(flag(args, "--url"), /tab=0/);
+  assert.match(flag(args, "--ask-click"), /"tab":false/);
+  assert.match(flag(args, "--ask-file"), new RegExp(`ask/${process.pid}\\.json$`));
+  assert.strictEqual(flag(args, "--url"), "", "a named window needs no link");
 });
 
 test("raises no window of its own when nothing has the folder open", () => {
@@ -201,6 +203,15 @@ test("raises no window of its own when nothing has the folder open", () => {
   assert.strictEqual(flag(args, "--folder"), "", "a folder no window has open would open a new one");
 });
 
+test("finds the window by folder when its socket names no window", () => {
+  // A session started in a terminal carries the window's socket; the extension
+  // host of that window has none to publish, so nothing matches by it and the
+  // folders are the answer. Vetoing them left every such session alerting over
+  // the chat in front of the user.
+  const args = runHook("stop", { focused: true, windowId: "/tmp/vscode-ipc-probe.sock" });
+  assert.strictEqual(args, null);
+});
+
 test("a question asked through the permission hook stays a question", () => {
   const args = runHook("permission", {
     focused: false,
@@ -215,17 +226,17 @@ test("a question asked through the permission hook stays a question", () => {
 
 test("offers to answer where a window says it can", () => {
   const args = runHook("permission", { focused: false, accept: true });
-  assert.match(flag(args, "--accept-file"), new RegExp(`accept/${process.pid}\\.json$`));
+  assert.match(flag(args, "--ask-accept"), /"action":"accept"/);
 });
 
 test("offers no answer where no window can give one", () => {
   const args = runHook("permission", { focused: false });
-  assert.strictEqual(flag(args, "--accept-file"), "");
+  assert.strictEqual(flag(args, "--ask-accept"), "");
 });
 
 test("offers no answer for a finished task", () => {
   const args = runHook("stop", { focused: false, accept: true });
-  assert.strictEqual(flag(args, "--accept-file"), "");
+  assert.strictEqual(flag(args, "--ask-accept"), "");
 });
 
 test("offers no answer to a question, which has to be read first", () => {
@@ -234,7 +245,7 @@ test("offers no answer to a question, which has to be read first", () => {
     accept: true,
     payload: { tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Which?" }] } },
   });
-  assert.strictEqual(flag(args, "--accept-file"), "");
+  assert.strictEqual(flag(args, "--ask-accept"), "");
 });
 
 console.log("with a presence report");
@@ -253,6 +264,31 @@ test("alerts when the reported chat is hidden", () => {
     presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 2 }],
   });
   assert.ok(args, "a hidden chat is not one the user is looking at");
+});
+
+test("stays quiet when a chat on screen has yet to name its session", () => {
+  // The chat has just been moved into the other side bar: the surface it came
+  // from still names the session behind a bar nobody sees, and the one showing
+  // it says nothing until that chat next speaks.
+  const args = runHook("stop", {
+    focused: true,
+    presence: [
+      { session: SESSION, kind: "sidebar", id: "claudeVSCodeSidebar", chat: true, visible: false, activeAt: 2 },
+      { session: "", kind: "sidebar", id: "claudeVSCodeSidebarSecondary", chat: true, visible: true, activeAt: 3 },
+    ],
+  });
+  assert.strictEqual(args, null);
+});
+
+test("alerts when every chat on screen belongs to another session", () => {
+  const args = runHook("stop", {
+    focused: true,
+    presence: [
+      { session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 2 },
+      { session: "another-session", kind: "sidebar", chat: true, visible: true, activeAt: 3 },
+    ],
+  });
+  assert.ok(args, "the chat on screen is a different one");
 });
 
 test("ignores the sessions list, which shows no chat", () => {
@@ -282,7 +318,7 @@ test("links to the surface the session was last worked in", () => {
       { session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 9 },
     ],
   });
-  assert.match(flag(args, "--url"), /tab=0/, "the side bar was the later of the two");
+  assert.match(flag(args, "--ask-click"), /"tab":false/, "the side bar was the later of the two");
 });
 
 console.log("with Codex as the agent");
@@ -328,9 +364,9 @@ test("stays quiet when a Codex chat is the tab on top", () => {
 test("ignores the chat tabs of Claude Code when Codex fired", () => {
   const args = runHook("permission", { focused: false, chatTabs: [TAB_TITLE] }, "codex");
   assert.strictEqual(flag(args, "--title"), "Codex needs permission");
-  const link = flag(args, "--url");
-  assert.match(link, /agent=codex/, "the link has to name the agent to open the right panel");
-  assert.doesNotMatch(link, /tab=/, "a Codex panel is opened by no tab flag");
+  const click = flag(args, "--ask-click");
+  assert.match(click, /"agent":"codex"/, "the request has to name the agent to open the right panel");
+  assert.match(click, /"tab":false/, "a Codex panel is opened by no tab of ours");
 });
 
 fs.rmSync(SANDBOX, { recursive: true, force: true });

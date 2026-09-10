@@ -11,7 +11,8 @@
 // Usage:
 //   claude-alert --title "..." --body "..." [--subtitle "..."] [--accent orange]
 //                [--timeout 0] [--folder /path] [--url vscode://…]
-//                [--accept-file /path] [--bundle-id id]
+//                [--ask-file /path] [--ask-click json] [--ask-accept json]
+//                [--bundle-id id]
 
 import AppKit
 
@@ -25,12 +26,15 @@ struct Options {
     var timeout: Double = 0
     /// Folder to hand the app, which brings the window holding it forward.
     var folder = ""
-    /// Deep link opened once that window is in front, to reveal the chat.
+    /// Deep link opened once that window is in front, to reveal the chat. Used
+    /// where no window could be named, and empty when there is none to tell.
     var url = ""
-    /// File the accept button writes for the window holding the chat, which
-    /// watches for it. Empty where nothing can answer, and then the alert
-    /// offers no such button.
-    var acceptFile = ""
+    /// File the window holding the chat watches, and what to leave in it: on a
+    /// click on the panel, and on the accept button. An empty body means that
+    /// way in is not offered — no button for the second one.
+    var askFile = ""
+    var askClick = ""
+    var askAccept = ""
     var bundleID = "com.microsoft.VSCode"
 }
 
@@ -52,7 +56,9 @@ func parseArgs() -> Options {
         case "--accent": o.accent = take()
         case "--folder": o.folder = take()
         case "--url": o.url = take()
-        case "--accept-file": o.acceptFile = take()
+        case "--ask-file": o.askFile = take()
+        case "--ask-click": o.askClick = take()
+        case "--ask-accept": o.askAccept = take()
         case "--bundle-id": o.bundleID = take()
         case "--timeout": o.timeout = Double(take()) ?? 0
         default: break
@@ -123,7 +129,7 @@ final class Controller: NSObject {
     /// has to be dismissible without going to the chat it came from.
     private var hasClose: Bool { opts.timeout <= 0 }
     /// Only where something on the other side can answer the request.
-    private var hasAccept: Bool { !opts.acceptFile.isEmpty }
+    private var hasAccept: Bool { !opts.askFile.isEmpty && !opts.askAccept.isEmpty }
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
     /// Whether the whole command is on screen, or only its first lines.
     private var expanded = false
@@ -411,8 +417,14 @@ final class Controller: NSObject {
     /// Like a dismissal that also answers: the file is left for the window
     /// holding the chat, nothing is brought forward, and the panel goes away.
     @objc private func accept() {
-        try? Data("1".utf8).write(to: URL(fileURLWithPath: opts.acceptFile))
+        ask(opts.askAccept)
         dismiss()
+    }
+
+    /// Leave a request for the window holding the chat, which watches for it.
+    private func ask(_ body: String) {
+        guard !opts.askFile.isEmpty, !body.isEmpty else { return }
+        try? Data(body.utf8).write(to: URL(fileURLWithPath: opts.askFile))
     }
 
     /// The body of a permission alert, coloured where it is a shell command:
@@ -643,6 +655,10 @@ final class Controller: NSObject {
     /// folder; launching the app with the folder as an argument would open a
     /// second window for it instead.
     private func openTarget() {
+        // The window is told what to show before it is raised: it watches for
+        // the request either way, and this way the chat is already coming up as
+        // the window arrives.
+        ask(opts.askClick)
         if opts.folder.isEmpty {
             // Nothing to raise by folder: activate the app itself, which brings
             // its existing windows forward without opening one.

@@ -15,7 +15,22 @@ shipped inside the `.vsix`.
 They meet in `~/.claude/floating-alert/`, which the extension fills on
 activation: the hook script, the binary, `config.json` (settings mirrored for
 the hook), `focus/<pid>.json` (one per window), `run/<session>.json` (one per
-live alert). The path is stable across extension updates, which is the point.
+live alert), `ask/<pid>.json` (what a clicked alert wants of one window) and
+`log.jsonl` (one line per event, with what the decision was made on). The path
+is stable across extension updates, which is the point.
+
+## A click goes to a window by name
+
+Raising the window is the alert's own doing — `open -b <bundle> <folder>` — but
+what to show inside it is left in `ask/<pid>.json`, named after the extension
+host of the window holding that chat, which watches for it. The same file
+carries the accept button's answer.
+
+The obvious channel would be the `vscode://` link, and it is still there for the
+case where no window could be named. It cannot be the main one: VS Code hands a
+link to whichever window it likes — the last active one, which at the moment of
+a click is by definition not the one with the chat — and that window sees a
+folder that is not its own and does nothing at all.
 
 ## Two agents, one hook
 

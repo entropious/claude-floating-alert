@@ -19,14 +19,17 @@ export const RUN_DIR = path.join(INSTALL_DIR, "run");
 /** One file per VS Code window: its folders and whether it is focused. */
 export const FOCUS_DIR = path.join(INSTALL_DIR, "focus");
 /**
- * Where the accept button leaves its answer: a file named after the extension
- * host of the window holding the chat, which watches for it.
+ * Where a clicked alert leaves what it wants done — reveal this chat, or answer
+ * this request — in a file named after the extension host of the window holding
+ * that chat, which watches for it.
  *
- * A deep link would be the obvious channel, but VS Code hands a link to
- * whichever window it likes — the last active one — and the alert is clicked
- * precisely when that is some other window. A file names its window exactly.
+ * A deep link would be the obvious channel, and it stays as the fallback, but
+ * VS Code hands a link to whichever window it likes — the last active one — and
+ * an alert is clicked precisely when that is some other window. The other
+ * window then sees a folder that is not its own and does nothing at all. A file
+ * names its window exactly.
  */
-export const ACCEPT_DIR = path.join(INSTALL_DIR, "accept");
+export const ASK_DIR = path.join(INSTALL_DIR, "ask");
 
 interface HookEntry {
   type: string;

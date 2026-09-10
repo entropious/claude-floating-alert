@@ -18,6 +18,14 @@
 #
 #   bash .probe/devhost.sh raise            дождаться, пока окно стенда в фокусе
 #   bash .probe/devhost.sh fire [kind]      прогнать хук: stop | permission | question
+#   bash .probe/devhost.sh case sidebars    два окна, в обоих только чат в панели
+#
+#   Любой сценарий гоняется дважды: с патчем Claude Code (отчёты о поверхностях)
+#   и без него. Один вид профиля ставится вручную: flavour patched | plain.
+#
+#   PROBE_FOCUS=real гонит фокус по-настоящему — окна выходят вперёд сами, и
+#   проверяется в том числе то, как расширение публикует фокус. Работать рядом
+#   в это время нельзя, поэтому по умолчанию фокус подделывается (pretend).
 #   bash .probe/devhost.sh case matrix      все сочетания панели, вкладок и двух окон
 #   bash .probe/devhost.sh case matrix <кусок описания>
 #                                           только эти клетки, на уже поднятом окне
@@ -53,6 +61,51 @@ ARGS=(--user-data-dir="$PROFILE" --extensions-dir="$EXTENSIONS")
 CHECK=(node "$ROOT/.probe/devhost-check.js")
 
 cdp_up() { curl -s --max-time 2 "http://127.0.0.1:$CDP_PORT/json/version" > /dev/null 2>&1; }
+
+# Как выставляется «пользователь сейчас здесь».
+#
+#   real     — окно поднимается по-настоящему, как это делает человек. Проверка
+#              тогда захватывает и то, как расширение публикует фокус, — но
+#              прогон забирает фокус себе, и работать рядом нельзя.
+#   pretend  — подделывается строчка focused в файле окна. Никому не мешает и
+#              потому стоит по умолчанию; настоящую смену фокуса не проверяет.
+#
+# Выбор держится в файле, а не в переменной: команды стенда зовутся по одной, и
+# переменная впереди каждой из них — лишний вопрос о правах на каждый вызов.
+#   bash .probe/devhost.sh focus-mode real | pretend
+PROBE_FOCUS="${PROBE_FOCUS:-$(cat "$ROOT/.probe/focus-mode" 2>/dev/null || echo pretend)}"
+
+# Вывести вперёд окно такой-то папки, или увести редактор целиком (none).
+look_at() {
+	if [ "$PROBE_FOCUS" = "pretend" ]; then
+		if [ "$1" = "none" ]; then
+			PROBE_CWD="$PROBE_CWD1" "${CHECK[@]}" pretend off > /dev/null
+			PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" pretend off > /dev/null
+		else
+			# Фокус один на всех: назначая его окну, остальные уводим в фон.
+			PROBE_CWD="$1" "${CHECK[@]}" pretend on > /dev/null
+		fi
+		return 0
+	fi
+	if [ "$1" = "none" ]; then
+		# Ни одного окна редактора перед глазами — как когда ушли в браузер.
+		open -a Finder
+	else
+		# Открытие уже открытой папки поднимает её окно и ничего не заводит.
+		"$CODE" "${ARGS[@]}" "$1" > /dev/null 2>&1
+	fi
+	# Расширение пишет фокус на своём событии, и оно приходит не мгновенно.
+	for _ in $(seq 1 20); do
+		sleep 0.3
+		if [ "$1" = "none" ]; then
+			"${CHECK[@]}" focus | grep -q "в фокусе" || return 0
+		else
+			"${CHECK[@]}" focus | grep "в фокусе" | grep -q "$(basename "$1")" && return 0
+		fi
+	done
+	echo "окно $1 так и не вышло вперёд"
+	return 1
+}
 
 # Только процессы этого отладочного профиля, чужие окна VS Code не трогаются.
 host_pids() { ps ax -o pid,command | grep "user-data-dir=$PROFILE" | grep -v grep | awk '{print $1}'; }
@@ -91,7 +144,10 @@ deps)
 	# Claude Code берётся уже установленный — вместе с патчем, который в нём есть.
 	# Codex нужен не работающим, а зарегистрированным: сценарию хватает того,
 	# что редактор знает его контейнер и пишет его id в состояние окна.
-	for dir in "$HOME"/.vscode/extensions/anthropic.claude-code-* "$HOME"/.vscode/extensions/openai.chatgpt-*; do
+	# Colorizer берётся один, самый свежий: установленных версий рядом лежит
+	# несколько, и профиль с ними всеми выбирал бы её сам.
+	colorizer=$(ls -d "$HOME"/.vscode/extensions/local.claude-code-colorizer-* 2>/dev/null | sort -V | tail -1)
+	for dir in "$HOME"/.vscode/extensions/anthropic.claude-code-* "$HOME"/.vscode/extensions/openai.chatgpt-* $colorizer; do
 		[ -d "$dir" ] || continue
 		target="$EXTENSIONS/$(basename "$dir")"
 		# Именно перезапись: патч в установленном Claude Code меняется, а копия
@@ -103,6 +159,35 @@ deps)
 	"${CHECK[@]}" register "$EXTENSIONS"
 	"${CHECK[@]}" seed "$PROFILE"
 	echo "готово; своё расширение окно берёт из рабочего дерева, ставить его не нужно"
+	;;
+
+# Профиль в одном из двух видов. Патч Claude Code — это отчёты о поверхностях,
+# и с ними хук отвечает точно; без них он работает на одних окнах и ярлыках
+# вкладок. Обе дороги живые, и проверять надо обе.
+flavour)
+	want="${2:-patched}"
+	# Выбор запоминается: пока он стоит, сценарии идут только в этом виде — иначе
+	# каждый прогон гоняет оба. `flavour both` снимает выбор.
+	if [ "$want" = "both" ]; then
+		rm -f "$ROOT/.probe/flavour"
+		echo "профиль: оба вида"
+		exit 0
+	fi
+	echo "$want" > "$ROOT/.probe/flavour"
+	bash "$0" deps > /dev/null || exit 1
+	if [ "$want" = "plain" ]; then
+		# Патч оставляет рядом исходные файлы — по ним копия возвращается к
+		# нетронутому Claude Code, и отчитываться о чатах становится нечему.
+		originals=$(find "$EXTENSIONS" -name '*.ccc-orig')
+		[ -n "$originals" ] || { echo "в копии нет исходников патча: установленный Claude Code не пропатчен?"; exit 1; }
+		for orig in $originals; do cp "$orig" "${orig%.ccc-orig}"; done
+		rm -rf "$EXTENSIONS"/local.claude-code-colorizer-*
+		"${CHECK[@]}" register "$EXTENSIONS" > /dev/null
+	fi
+	# Отчёты прошлого вида пережили бы смену профиля: файлы лежат в ~/.claude, а
+	# не в нём, и мёртвыми их делает только смерть хоста.
+	rm -f "$HOME/.claude/floating-alert/presence/"*.json
+	echo "профиль: $want"
 	;;
 
 start)
@@ -164,10 +249,14 @@ stop)
 	# встречает диалогом «Reopen», который ждёт мышку. Просить надо каждое —
 	# команда доходит до того окна, чью папку ей называют.
 	if cdp_up; then
-		PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" command "Close Window" > /dev/null 2>&1
-		sleep 1
-		"${CHECK[@]}" command "Close Window" > /dev/null 2>&1
-		for _ in $(seq 1 10); do cdp_up || break; sleep 1; done
+		# Перед просьбой — Escape: открытая палитра или подсказка съедает команду,
+		# окно остаётся жить, и дальше его добивает сигнал.
+		for folder in "$PROBE_CWD2" "$PROBE_CWD"; do
+			PROBE_CWD="$folder" "${CHECK[@]}" escape > /dev/null 2>&1
+			PROBE_CWD="$folder" "${CHECK[@]}" command "Close Window" > /dev/null 2>&1
+			sleep 1
+		done
+		for _ in $(seq 1 15); do cdp_up || break; sleep 1; done
 	fi
 	for pid in $(host_pids); do kill "$pid" 2>/dev/null; done
 	# Редактор закрывается не мгновенно, а start считает живой CDP признаком
@@ -230,6 +319,7 @@ raise)
 	;;
 
 command)
+	[ -n "${3:-}" ] && export PROBE_CWD="$3"
 	"${CHECK[@]}" command "${2:?нужно название команды}"
 	;;
 
@@ -241,13 +331,55 @@ chat-tab) "${CHECK[@]}" focus-tab chat ;;
 code-tab) "${CHECK[@]}" focus-tab code ;;
 # Панель в нужное положение, чем бы она ни была до того: щелчок по алерту сам
 # её открывает, и следующая проверка иначе смотрела бы на другое состояние.
+# Видно ли сейчас чат в боковой полосе окна такой-то папки, и что в этих полосах
+# вообще стоит.
+panel)
+	[ -n "${2:-}" ] && export PROBE_CWD="$2"
+	"${CHECK[@]}" panel
+	;;
+bars)
+	[ -n "${2:-}" ] && export PROBE_CWD="$2"
+	"${CHECK[@]}" bars
+	;;
+hide-chat)
+	[ -n "${2:-}" ] && export PROBE_CWD="$2"
+	"${CHECK[@]}" hide-chat
+	;;
+# Выражение в главном фрейме окна такой-то папки — чтобы разбираться с разметкой
+# редактора, не угадывая её.
+eval)
+	[ -n "${3:-}" ] && export PROBE_CWD="$3"
+	"${CHECK[@]}" eval "${2:?нужно выражение}"
+	;;
+# Как выставлять «пользователь сейчас здесь» во всех дальнейших прогонах.
+focus-mode)
+	case "${2:-}" in
+	real|pretend) echo "${2}" > "$ROOT/.probe/focus-mode"; echo "фокус: ${2}" ;;
+	*) echo "фокус: $PROBE_FOCUS (real | pretend)" ;;
+	esac
+	;;
 panel-hidden|panel-shown)
+	# Папку можно назвать прямо здесь: команды для второго окна иначе пришлось бы
+	# звать с переменной впереди, а это лишний вопрос о правах на каждый вызов.
+	[ -n "${2:-}" ] && export PROBE_CWD="$2"
+	# Команда палитры доходит только до окна, которое и правда впереди: у окна в
+	# фоне палитра не открывается вовсе, и переключать было бы нечего. Фокус тут
+	# ничего не решает — состояние выставляется до события или уже после алерта.
+	[ "$PROBE_FOCUS" = "real" ] && { look_at "$PROBE_CWD" || exit 1; }
 	want="скрыта"; [ "$1" = "panel-shown" ] && want="видима"
+	# Попыток с запасом: в только что поднятом окне Claude Code ещё грузится, и
+	# первые команды уходят в пустоту.
+	# Прятать надо ту полосу, в которой чат сейчас и стоит, — а стоять он может
+	# в любой из двух, и в обеих сразу. Этим занимается сама проверка.
+	if [ "$want" = "скрыта" ]; then
+		"${CHECK[@]}" hide-chat
+		exit $?
+	fi
 	# Попыток с запасом: в только что поднятом окне Claude Code ещё грузится, и
 	# первые команды уходят в пустоту.
 	for _ in $(seq 1 20); do
 		[ "$("${CHECK[@]}" panel)" = "$want" ] && { echo "панель: $want"; exit 0; }
-		if [ "$want" = "видима" ]; then bash "$0" sidebar > /dev/null; else bash "$0" hide > /dev/null; fi
+		bash "$0" sidebar > /dev/null
 		sleep 0.5
 	done
 	echo "панель не встала в положение: $want"; exit 1
@@ -273,8 +405,10 @@ event)
 # редактора чат или код.
 cell-state)
 	export PROBE_CWD="$2"
-	bash "$0" "panel-$3" > /dev/null || exit 1
-	bash "$0" "$4-tab" > /dev/null || exit 1
+	# Причина провала говорится вслух: клетка иначе падает молча, и остаётся
+	# гадать, панель это не встала или вкладка не поднялась.
+	bash "$0" "panel-$3" > /dev/null || { echo "панель не встала: $3"; exit 1; }
+	bash "$0" "$4-tab" || { echo "поверх редактора не встало: $4"; exit 1; }
 	;;
 
 # Пара чатов в окне: один в панели, другой вкладкой, у каждого своя сессия.
@@ -298,7 +432,11 @@ seed)
 	# чат остался бы на экране. Со снятым замком он ложится к чату в одни вкладки,
 	# и «поверх» снова что-то значит.
 	"${CHECK[@]}" unlock > /dev/null
-	"${CHECK[@]}" command "File: New Untitled Text File" > /dev/null; sleep 1
+	# Настоящий файл, а не пустая вкладка: несохранённая вкладка не даёт окну
+	# закрыться — на выходе оно спрашивает про сохранение, не дожидается ответа и
+	# умирает от сигнала, оставляя после себя «окно завершилось неожиданно».
+	echo "просто код, чтобы было чем перекрыть чат" > "$PROBE_CWD/code.txt"
+	"$CODE" "${ARGS[@]}" "$PROBE_CWD/code.txt" > /dev/null 2>&1; sleep 1
 	# Вкладка сперва отчитывается сессией панели и поправляется, когда её чат
 	# заговорит сам; ждём именно её собственную.
 	seed_tab=$("${CHECK[@]}" wait-session tab 25 "$seed_sidebar") || exit 1
@@ -319,14 +457,7 @@ cell)
 	export PROBE_CWD="$folder"
 	kill_alerts
 	"${CHECK[@]}" forget > /dev/null
-	if [ "$here" = "none" ]; then
-		# Ни одного окна перед глазами — свёрнуты все.
-		PROBE_CWD="$PROBE_CWD1" "${CHECK[@]}" pretend off > /dev/null
-		PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" pretend off > /dev/null
-	else
-		# Фокус один на всех: назначая его окну, остальные уводим в фон.
-		PROBE_CWD="$here" "${CHECK[@]}" pretend on > /dev/null
-	fi
+	look_at "$here"
 	"${CHECK[@]}" fire permission "$session" > /dev/null
 	if [ "$want" = "silence" ]; then
 		"${CHECK[@]}" expect silence || exit 1
@@ -334,8 +465,15 @@ cell)
 		"${CHECK[@]}" expect alert || exit 1
 		# Цель уводится с экрана до щелчка: иначе проверка сошлась бы и без него —
 		# сессия и так на месте, а щелчок мог не сработать вовсе.
-		bash "$0" panel-hidden > /dev/null || exit 1
-		[ "$surface" = "tab" ] && { bash "$0" code-tab > /dev/null || exit 1; }
+		#
+		# При честном фокусе так нельзя: чтобы что-то спрятать в окне события,
+		# его надо вывести вперёд, а расширение на это гасит его же алерты —
+		# нажимать станет нечего. Там щелчок и проверяется по-другому: он обязан
+		# вывести окно события вперёд, а не только показать чат.
+		if [ "$PROBE_FOCUS" = "pretend" ]; then
+			bash "$0" panel-hidden > /dev/null || exit 1
+			[ "$surface" = "tab" ] && { bash "$0" code-tab > /dev/null || exit 1; }
+		fi
 		"${CHECK[@]}" press "$PROFILE" "$EXTENSIONS" > /dev/null || exit 1
 		"${CHECK[@]}" landed "$session" "$surface" || exit 1
 	fi
@@ -353,6 +491,7 @@ explorer) "${CHECK[@]}" command "View: Show Explorer" ;;
 codexbar) "${CHECK[@]}" command "Codex: Open Codex Sidebar" ;;
 
 fire)
+	[ -n "${5:-}" ] && export PROBE_CWD="$5"
 	kill_alerts
 	"${CHECK[@]}" fire "${2:-stop}" "${3:-}" "${4:-}"
 	sleep 1
@@ -360,6 +499,23 @@ fire)
 	;;
 
 case)
+	# Каждый сценарий идёт дважды: с патчем Claude Code и без него. Хук отвечает
+	# по-разному — отчёты о поверхностях против окон и ярлыков вкладок, — и
+	# проверка одного вида ничего не говорит о другом.
+	#
+	# Кроме прогона одной клетки: он возвращается к уже поднятому окну, каким бы
+	# оно ни было, и второй вид только погасил бы его.
+	if [ -z "${PROBE_FLAVOUR:-}" ] && [ -z "${3:-}" ]; then
+		status=0
+		chosen=$(cat "$ROOT/.probe/flavour" 2>/dev/null || echo "patched plain")
+		for flavour in $chosen; do
+			echo "=== профиль: $flavour"
+			bash "$0" flavour "$flavour" > /dev/null || exit 1
+			PROBE_FLAVOUR="$flavour" bash "$0" "$@" || status=1
+		done
+		exit "$status"
+	fi
+
 	# Сессии и панели копятся от прогона к прогону, и сценарий начинает смотреть
 	# на чужое состояние — поэтому каждый идёт со свежего окна.
 	#
@@ -416,6 +572,42 @@ case)
 		"${CHECK[@]}" pretend off
 		bash "$0" fire permission "" codex > /dev/null
 		"${CHECK[@]}" expect alert "agent=codex" || exit 1
+		;;
+	sidebars)
+		# Самое простое, что бывает: два окна, в каждом чат в панели и ни одной
+		# вкладки. Пишут в панель своего окна — алерту взяться неоткуда.
+		echo "== два окна, в обоих открыт чат в панели"
+		for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
+			export PROBE_CWD="$folder"
+			# По очереди: пока окно позади, редактор не рисует его вебвью и печатать
+			# в чат некуда. Поднимает окно открытие его же папки.
+			"$CODE" "${ARGS[@]}" "$PROBE_CWD" > /dev/null 2>&1
+			sleep 1
+			bash "$0" panel-shown > /dev/null || exit 1
+			"${CHECK[@]}" ask claude "напиши слово один" > /dev/null || exit 1
+			session=$("${CHECK[@]}" wait-session sidebar 20) || exit 1
+			echo "$session" > "$ROOT/.probe/sidebar-$(basename "$folder")"
+			echo "-- $(basename "$folder"): панель ${session:0:8}"
+		done
+
+		# Оба чата ещё отвечают, и каждый закончит своим Stop — настоящий алерт
+		# посреди проверок.
+		for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
+			PROBE_CWD="$folder" "${CHECK[@]}" \
+				wait-answer "$(cat "$ROOT/.probe/sidebar-$(basename "$folder")")" 40 > /dev/null || exit 1
+		done
+		kill_alerts
+
+		for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
+			export PROBE_CWD="$folder"
+			session=$(cat "$ROOT/.probe/sidebar-$(basename "$folder")")
+			echo "-- событие из $(basename "$folder"), пользователь в нём же"
+			"${CHECK[@]}" forget > /dev/null
+			"${CHECK[@]}" pretend on > /dev/null
+			"${CHECK[@]}" surfaces
+			"${CHECK[@]}" fire permission "$session" > /dev/null
+			"${CHECK[@]}" expect silence || exit 1
+		done
 		;;
 	matrix)
 		# Всё, от чего зависит судьба алерта: из какого окна пришло событие, где
@@ -481,12 +673,19 @@ case)
 
 						# Состояние выставляется заново перед каждой проверкой:
 						# щелчок по алерту сам открывает панель или вкладку.
-						bash "$0" cell-state "$folder" "$panel" "$top" || exit 1
+						bash "$0" cell-state "$folder" "$panel" "$top" \
+							|| { echo "не выставилось состояние клетки"; exit 1; }
 						want=alert
 						[ "$here" = "$from" ] && [ "$panel" = shown ] && want=silence
+						# Без отчётов о поверхностях панель для расширения невидима
+						# вовсе: открыта она или спрятана, знать неоткуда, и окно
+						# перед глазами — единственное, на что тут можно опереться.
+						# Так было до отчётов и так остаётся, где их нет.
+						[ "${PROBE_FLAVOUR:-}" = "plain" ] && [ "$here" = "$from" ] && want=silence
 						bash "$0" cell "$at" "$folder" "$in_panel" "$want" sidebar || exit 1
 
-						bash "$0" cell-state "$folder" "$panel" "$top" || exit 1
+						bash "$0" cell-state "$folder" "$panel" "$top" \
+							|| { echo "не выставилось состояние клетки"; exit 1; }
 						want=alert
 						[ "$here" = "$from" ] && [ "$top" = chat ] && want=silence
 						bash "$0" cell "$at" "$folder" "$in_tab" "$want" tab || exit 1

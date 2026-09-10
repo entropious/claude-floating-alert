@@ -19,17 +19,26 @@ const FOCUS_DIR = path.join(ROOT, "focus");
 /** Optional: whether the chat is on screen, reported by a patched Claude Code. */
 const PRESENCE_DIR = path.join(ROOT, "presence");
 const CONFIG_FILE = path.join(ROOT, "config.json");
-/** Deep link a clicked panel opens to bring its chat forward. */
+/**
+ * Where a clicked panel leaves what it wants done — reveal this chat, answer
+ * this request — one file per window, named after its extension host.
+ *
+ * A deep link says the same thing, but goes to whichever window VS Code hands
+ * it to: the last active one, which at the moment of a click is by definition
+ * not the one with the chat, or there would have been no alert. That window
+ * sees a folder that is not its own and does nothing.
+ */
+const ASK_DIR = path.join(ROOT, "ask");
+/** The same request as a link, for when no window could be named. */
 const REVEAL_URL = "vscode://entro.claude-floating-alert/reveal";
 /**
- * Where the accept button leaves its answer, one file per window: the window
- * holding the chat watches for its own and takes the first option.
- *
- * A deep link would go to whichever window VS Code hands it to — the last
- * active one, which at the moment of the click is by definition not the one
- * with the chat, or the alert would never have fired.
+ * One line per event, and what the decision was made on. An alert that should
+ * not have appeared — or one that never did — leaves nothing else behind: the
+ * hook is spawned by the agent, and its output goes nowhere anyone reads.
  */
-const ACCEPT_DIR = path.join(ROOT, "accept");
+const LOG_FILE = path.join(ROOT, "log.jsonl");
+/** Enough lines to cover a session's worth of events, and no growth after that. */
+const LOG_LINES = 200;
 
 const VSCODE_BUNDLE_ID = "com.microsoft.VSCode";
 /** Per-window socket path: the same value in the window's terminals and its
@@ -262,8 +271,8 @@ function tabBelongs(label, marks) {
   return clean === UNTITLED_TAB && !marks.aiTitle && !marks.firstMessage;
 }
 
-/** Every live VS Code window this session could belong to. */
-function windowsFor(cwd) {
+/** Every VS Code window that is still running, whatever it has open. */
+function liveWindows() {
   let files = [];
   try {
     files = fs.readdirSync(FOCUS_DIR);
@@ -278,12 +287,27 @@ function windowsFor(cwd) {
     } catch {
       continue;
     }
-    if (!isAlive(state.pid)) continue;
-    if (WINDOW_ID ? state.window === WINDOW_ID : cwd && (state.folders || []).some((f) => isInside(cwd, f))) {
-      windows.push(state);
-    }
+    if (isAlive(state.pid)) windows.push(state);
   }
   return windows;
+}
+
+/**
+ * Every live VS Code window this session could belong to.
+ *
+ * The window socket names one window exactly, and where both sides have it that
+ * is the answer. Only one side usually does: a session started in a terminal of
+ * a window carries it, the extension host of that window does not — VS Code
+ * puts it in terminals, not in the host — so a socket that matches nothing is
+ * no answer at all, and the folders decide instead. Letting it veto them left
+ * every terminal-started session without a window, and so with an alert for
+ * every event, chat in front or not.
+ */
+function windowsFor(cwd) {
+  const live = liveWindows();
+  const named = WINDOW_ID ? live.filter((state) => state.window === WINDOW_ID) : [];
+  if (named.length > 0) return named;
+  return cwd ? live.filter((state) => (state.folders || []).some((f) => isInside(cwd, f))) : [];
 }
 
 /** What one VS Code window last published about itself, if it is still alive. */
@@ -314,14 +338,30 @@ function focusedWindow(cwd) {
  * Claude Code that has not started yet, a host that died and left its file
  * behind — and the caller then falls back to what it can work out on its own.
  */
-function chatSurfaces(pid, all) {
+function presenceOf(pid) {
   let state;
   try {
     state = JSON.parse(fs.readFileSync(path.join(PRESENCE_DIR, `${pid}.json`), "utf-8"));
   } catch {
     return null;
   }
-  if (!isAlive(state.pid)) return null;
+  return isAlive(state.pid) ? state : null;
+}
+
+/** Every extension host that is reporting its chats right now. */
+function reportingPids() {
+  let files = [];
+  try {
+    files = fs.readdirSync(PRESENCE_DIR);
+  } catch {
+    return [];
+  }
+  return files.map((name) => Number(path.basename(name, ".json"))).filter((pid) => pid > 0);
+}
+
+function chatSurfaces(pid, all) {
+  const state = presenceOf(pid);
+  if (!state) return null;
   // The sessions list is a webview of its own and names a session without ever
   // showing it; a report that predates the distinction marks nothing. Whoever
   // asks for everything wants that entry too — naming a session without showing
@@ -330,24 +370,63 @@ function chatSurfaces(pid, all) {
 }
 
 /** The surfaces holding one session, across every reporting window. */
-function surfacesOf(sessionId) {
+function surfacesOf(sessionId, all) {
   if (!sessionId) return [];
-  let files = [];
-  try {
-    files = fs.readdirSync(PRESENCE_DIR);
-  } catch {
-    return [];
-  }
   const found = [];
-  for (const name of files) {
-    const pid = Number(path.basename(name, ".json"));
-    const surfaces = chatSurfaces(pid);
+  for (const pid of reportingPids()) {
+    const surfaces = chatSurfaces(pid, all);
     if (!surfaces) continue;
     for (const surface of surfaces) {
       if (surface.session === sessionId) found.push({ ...surface, pid });
     }
   }
   return found;
+}
+
+/**
+ * Whether the window of one extension host has focus. Two files carry the same
+ * flag, both written by that host, and what differs is when. Ours is written on
+ * the focus change itself, so it is never behind; the report of a patched
+ * Claude Code is written on chat events, and going to another window is not
+ * one — it keeps saying "focused" until that chat is touched again.
+ *
+ * So ours answers wherever it exists, and the report answers for a window our
+ * extension has not run in.
+ */
+function windowFocused(pid) {
+  const state = windowState(pid);
+  if (state) return !!state.focused;
+  const report = presenceOf(pid);
+  return report ? !!report.focused : false;
+}
+
+/**
+ * What a patched Claude Code says about this session, across every window it
+ * reports: `true` when the chat is on screen in a window that has focus,
+ * `false` when the reports cover the session and put it nowhere like that.
+ *
+ * `null` means they answer nothing about it, and the caller then works it out
+ * on its own. Every way of answering nothing ends here: nobody reporting, a
+ * report that never names this session, and a report that names it only behind
+ * something out of sight while a chat on screen has yet to say whose it is —
+ * the side bar a chat has just been moved into says nothing until that chat
+ * next speaks, and the bar it came from goes on naming the session.
+ */
+function reportedWatch(sessionId) {
+  const surfaces = surfacesOf(sessionId, true);
+  if (surfaces.length === 0) return null;
+  for (const surface of surfaces) {
+    if (surface.chat === false || !surface.visible) continue;
+    if (windowFocused(surface.pid)) return true;
+  }
+  for (const pid of reportingPids()) {
+    if (!windowFocused(pid)) continue;
+    const blind = (chatSurfaces(pid, false) || []).some(
+      (surface) => surface.visible && !surface.session
+    );
+    if (blind) return null;
+  }
+  return false;
 }
 
 /**
@@ -383,14 +462,13 @@ function windowFolder(cwd, sessionId) {
 }
 
 /**
- * The extension host to leave the answer for: the window holding this chat,
- * among those saying they can answer at all.
+ * The extension host to leave the request for: the window holding this chat.
  *
  * Same order as raising a window: a window reporting the session itself is the
  * sure answer, and without reports the closest folder around it wins.
  */
-function acceptWindow(cwd, sessionId) {
-  const windows = windowsFor(cwd).filter((state) => state.accept);
+function askWindow(cwd, sessionId) {
+  const windows = windowsFor(cwd);
   for (const surface of surfacesOf(sessionId)) {
     const reporting = windows.find((state) => state.pid === surface.pid);
     if (reporting) return reporting.pid;
@@ -434,22 +512,23 @@ function sessionIsInTab(cwd, sessionId) {
 }
 
 function sessionIsWatched(cwd, sessionId, agent) {
+  if (agent === "codex") {
+    const window = focusedWindow(cwd);
+    return window ? codexIsWatched(window) : false;
+  }
+
+  // A patched Claude Code names the session behind every surface, and where it
+  // does the answer is exact — whichever window that turns out to be. It is
+  // asked first for that reason: our own way of finding the window can come up
+  // empty where the report is certain, and one source failing must never cost
+  // the other.
+  const reported = reportedWatch(sessionId);
+  if (reported !== null) return reported;
+
+  // Nothing reported about this session. Everything from here is what can be
+  // worked out without help: the window in front, and the labels of its tabs.
   const window = focusedWindow(cwd);
   if (!window) return false;
-
-  if (agent === "codex") return codexIsWatched(window);
-
-  // A patched Claude Code names the session behind every surface, so the answer
-  // is exact: this chat is in front of the user, or it is not.
-  //
-  // Exact only about the surfaces it does name, though. A report that never
-  // mentions this session says nothing about it — a chat tab the patch has not
-  // published yet is the ordinary case — and reading that silence as "not on
-  // screen" raised an alert over the very tab being typed in. Unmentioned means
-  // unknown, and unknown falls through to the tabs and the window below.
-  const reported = chatSurfaces(window.pid, true) || [];
-  const mine = reported.filter((surface) => surface.session === sessionId);
-  if (mine.length > 0) return mine.some((surface) => surface.chat !== false && surface.visible);
 
   const marks = sessionMarks(cwd, sessionId);
   // Nothing to match tabs against: the window is the only thing left to go on.
@@ -534,7 +613,44 @@ function compose(kind, input, agent) {
 /** Why an event produced no panel — silence is the normal case, and the reasons
  *  for it are spread across windows, surfaces and panels of other events. */
 function explain(reason) {
+  outcome = reason;
   if (process.env.CFA_DEBUG) process.stderr.write(`claude-floating-alert: ${reason}\n`);
+}
+
+/** What this run decided, and why. Written out once the run is over. */
+let outcome = "";
+
+/**
+ * Keep the event and everything it was judged on. Which windows were live, what
+ * each said about itself, and what any patched Claude Code reported — the whole
+ * answer, since a wrong decision is only ever explained by what went into it.
+ */
+function record(kind, input, agent) {
+  const cwd = input.cwd || "";
+  try {
+    const windows = windowsFor(cwd).map((state) => ({
+      ...state,
+      surfaces: chatSurfaces(state.pid, true),
+    }));
+    const line = JSON.stringify({
+      at: new Date().toISOString(),
+      kind,
+      agent,
+      session: input.session_id || "",
+      cwd,
+      tool: input.tool_name || "",
+      hookWindow: WINDOW_ID,
+      outcome: outcome || "alert",
+      windows,
+    });
+    let kept = [];
+    try {
+      kept = fs.readFileSync(LOG_FILE, "utf-8").split("\n").filter(Boolean);
+    } catch {}
+    kept.push(line);
+    fs.mkdirSync(ROOT, { recursive: true });
+    fs.writeFileSync(LOG_FILE, `${kept.slice(-LOG_LINES).join("\n")}\n`);
+  } catch {}
 }
 
 function main(kind, input, agent) {
@@ -555,27 +671,41 @@ function main(kind, input, agent) {
   }
 
   const { subtitle, title, body } = compose(kind, input, agent);
-  // The folder raises the window that has it open; the link then tells that
-  // window which chat to bring forward. Without a window to receive it the link
-  // would make VS Code open an empty one, so it is only sent when one is there.
-  const link = windowsFor(cwd).length
-    ? `${REVEAL_URL}?${new URLSearchParams({
-        agent,
-        session: session || "",
-        cwd,
-        // A Codex chat is opened by its panel, which takes no session: the flag
-        // stays out of the link rather than carrying an answer nobody uses.
-        ...(agent === "codex" ? {} : { tab: sessionIsInTab(cwd, session) ? "1" : "0" }),
-      })}`
+  const inTab = agent !== "codex" && sessionIsInTab(cwd, session);
+  // The folder raises the window that has it open; what to bring forward inside
+  // it is said separately, and to that window by name. The window is named by
+  // the process of its extension host, which is what watches for the request.
+  const target = askWindow(cwd, session);
+  const askFile = target ? path.join(ASK_DIR, `${target}.json`) : "";
+  const click = target
+    ? JSON.stringify({ action: "reveal", agent, session: session || "", tab: inTab })
     : "";
+
+  // The link says the same thing to whichever window VS Code hands it to, and
+  // is what is left when no window could be named — a chat whose window has not
+  // published itself, or none at all. Sent only where some window has the folder
+  // open: a link nobody claims makes VS Code open an empty window for it.
+  const link =
+    !target && windowsFor(cwd).length
+      ? `${REVEAL_URL}?${new URLSearchParams({
+          agent,
+          session: session || "",
+          cwd,
+          // A Codex chat is opened by its panel, which takes no session: the
+          // flag stays out of the link rather than carrying an answer nobody
+          // uses.
+          ...(agent === "codex" ? {} : { tab: inTab ? "1" : "0" }),
+        })}`
+      : "";
 
   // A permission request can be granted from the alert itself, where the window
   // holding the chat has the extension that tells it to take the first option.
   // Everything else gets no such button: a finished task has nothing to answer,
   // a Codex chat is beyond that extension, and a question has to be read before
   // it can be answered — taking its first option blind is not an answer.
-  const acceptPid = kind === "permission" && agent !== "codex" ? acceptWindow(cwd, session) : 0;
-  const accept = acceptPid ? path.join(ACCEPT_DIR, `${acceptPid}.json`) : "";
+  const canAccept =
+    kind === "permission" && agent !== "codex" && target && windowState(target)?.accept;
+  const accept = canAccept ? JSON.stringify({ action: "accept" }) : "";
 
   killPrevious(session);
 
@@ -589,7 +719,9 @@ function main(kind, input, agent) {
       "--timeout", String(config.timeout),
       "--folder", windowFolder(cwd, session),
       "--url", link,
-      "--accept-file", accept,
+      "--ask-file", askFile,
+      "--ask-click", click,
+      "--ask-accept", accept,
       "--bundle-id", VSCODE_BUNDLE_ID,
     ],
     { detached: true, stdio: "ignore" }
@@ -606,8 +738,13 @@ process.stdin.on("end", () => {
   try {
     input = JSON.parse(raw);
   } catch {}
+  const kind = questionKind(process.argv[2] || "", input);
+  const agent = agentId(process.argv);
   try {
-    main(questionKind(process.argv[2] || "", input), input, agentId(process.argv));
-  } catch {}
+    main(kind, input, agent);
+  } catch (error) {
+    explain(`the hook itself failed: ${error}`);
+  }
+  record(kind, input, agent);
   process.exit(0);
 });
