@@ -940,8 +940,16 @@ final class Controller: NSObject {
     /// when it is busy. Whether it worked is knowable — every window publishes
     /// its focus for the hook to read, and so can this.
     private func raiseUntilFront(_ folder: String) {
-        for _ in 0..<4 {
-            raise(folder)
+        for attempt in 0..<4 {
+            // The system is asked first, and usually that is the end of it. The
+            // editor's own command line comes second because it runs the app as
+            // a helper process, and the Dock shows the icon for as long as that
+            // takes — a flash for something the first way did without one.
+            if attempt == 0 {
+                runOpen(["-b", opts.bundleID, folder])
+            } else {
+                raise(folder)
+            }
             let until = Date().addingTimeInterval(0.4)
             while Date() < until {
                 if windowInFront(folder) { return }
