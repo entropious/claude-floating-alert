@@ -39,6 +39,9 @@ struct Options {
     /// Log to open from the panel. Handed over only when something went wrong
     /// putting the alert together, and then the panel offers a way to see what.
     var logFile = ""
+    /// The commands of the line being asked about, each marked `+` where the
+    /// user has already allowed it and `-` where they have not.
+    var commands = ""
     var bundleID = "com.microsoft.VSCode"
 }
 
@@ -64,6 +67,7 @@ func parseArgs() -> Options {
         case "--ask-click": o.askClick = take()
         case "--ask-accept": o.askAccept = take()
         case "--log-file": o.logFile = take()
+        case "--commands": o.commands = take()
         case "--bundle-id": o.bundleID = take()
         case "--timeout": o.timeout = Double(take()) ?? 0
         default: break
@@ -75,6 +79,8 @@ func parseArgs() -> Options {
 /// How the hook marks a line about what went wrong while the alert was put
 /// together, so the panel can tell those from the event itself.
 let TROUBLE_MARK = "\u{26A0} "
+/// What the hook puts between the tool and what it is about to do.
+let TOOL_MARK = " \u{00B7} "
 
 func accentColor(_ name: String) -> NSColor {
     switch name {
@@ -204,6 +210,14 @@ final class Controller: NSObject {
 
         let title = label(opts.title, size: 14, weight: .bold, color: .labelColor, lines: 2)
         var textViews: [NSView] = [title]
+        // What the line is made of, above the line itself: which commands it
+        // runs, and which of them are already allowed.
+        var listView: NSView?
+        if let list = commandList() {
+            let view = coloured(list, lines: 2)
+            textViews.append(view)
+            listView = view
+        }
         if !opts.body.isEmpty {
             // What is cut off is said by a line of dots under the text: the last
             // line of a command ends in an ellipsis of its own often enough for
@@ -251,6 +265,9 @@ final class Controller: NSObject {
         textStack.orientation = .vertical
         textStack.alignment = .leading
         textStack.spacing = 3
+        // The list is a line about the command, not part of it: a gap under it
+        // keeps the two from reading as one paragraph.
+        if let listView { textStack.setCustomSpacing(9, after: listView) }
         textStack.translatesAutoresizingMaskIntoConstraints = false
 
         container.addSubview(stripe)
@@ -500,15 +517,19 @@ final class Controller: NSObject {
         let said = lines.filter { !$0.hasPrefix(TROUBLE_MARK) }.joined(separator: "\n")
         let wrong = lines.filter { $0.hasPrefix(TROUBLE_MARK) }
 
-        let prefix = "Bash · "
+        let prefix = "Bash\(TOOL_MARK)"
         let out = NSMutableAttributedString()
         if said.hasPrefix(prefix) {
-            out.append(
-                NSAttributedString(
-                    string: prefix,
-                    attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+            // Where the list above carries the tool, the command starts on its
+            // own; where there is no list, it keeps the name in front of it.
+            if toolName.isEmpty {
+                out.append(
+                    NSAttributedString(
+                        string: prefix,
+                        attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+                    )
                 )
-            )
+            }
             out.append(highlighted(String(said.dropFirst(prefix.count))))
         } else {
             out.append(
@@ -523,6 +544,74 @@ final class Controller: NSObject {
                 )
             )
         }
+        return out
+    }
+
+    /// Whether each command of the line has been allowed, by the word it starts
+    /// with. A name that stands for both an allowed use and one that is not —
+    /// `git status` beside `git push` — counts as not allowed: the colour in
+    /// the line cannot tell the two apart, and red is the honest half.
+    private lazy var commandStatus: [String: Bool] = {
+        var status: [String: Bool] = [:]
+        for one in opts.commands.split(separator: ",") where one.count > 1 {
+            let label = String(one.dropFirst())
+            guard let word = label.split(separator: " ").first.map(String.init) else { continue }
+            let allowed = one.hasPrefix("+")
+            status[word] = (status[word] ?? true) && allowed
+        }
+        return status
+    }()
+
+    /// The tool the hook named in front of the command, when there is a list to
+    /// carry it. Empty otherwise, and then the body keeps it.
+    private var toolName: String {
+        guard !opts.commands.isEmpty, let at = opts.body.range(of: TOOL_MARK) else { return "" }
+        return String(opts.body[opts.body.startIndex..<at.lowerBound])
+    }
+
+    /// The commands of the line, in green where they are already allowed and in
+    /// red where they are not. Nil when there is nothing to list.
+    private func commandList() -> NSAttributedString? {
+        let marked = opts.commands.split(separator: ",").map(String.init).filter { $0.count > 1 }
+        guard !marked.isEmpty else { return nil }
+        let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        // Brackets and commas in the plain text colour: dimmed, they vanish
+        // between the green and the red and the list reads as one word.
+        let punctuation: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let out = NSMutableAttributedString()
+        // The tool joins the list rather than heading the command: one line
+        // says what is being asked for, the next is the line itself.
+        if !toolName.isEmpty {
+            // Green where the whole line has already been allowed: one glance
+            // then says the request holds nothing new.
+            let settled = marked.allSatisfy { $0.hasPrefix("+") }
+            out.append(
+                NSAttributedString(
+                    string: "\(toolName): ",
+                    attributes: [
+                        .font: font,
+                        .foregroundColor: settled ? NSColor.systemGreen : NSColor.labelColor,
+                    ]
+                )
+            )
+        }
+        out.append(NSAttributedString(string: "[", attributes: punctuation))
+        for (at, one) in marked.enumerated() {
+            if at > 0 { out.append(NSAttributedString(string: ", ", attributes: punctuation)) }
+            out.append(
+                NSAttributedString(
+                    string: String(one.dropFirst()),
+                    attributes: [
+                        .font: font,
+                        .foregroundColor: one.hasPrefix("+") ? NSColor.systemTeal : NSColor.systemRed,
+                    ]
+                )
+            )
+        }
+        out.append(NSAttributedString(string: "]", attributes: punctuation))
         return out
     }
 
@@ -565,9 +654,19 @@ final class Controller: NSObject {
                 index = end
                 continue
             }
-            if breaks.contains(char) || char == "<" || char == ">" {
+            if char == "<" || char == ">" {
+                // A redirection and the descriptor it names — `2>&1` — belong
+                // to no command: what follows is not a command starting.
                 add(String(char), .secondaryLabelColor)
-                starting = true
+                index += 1
+                continue
+            }
+            if breaks.contains(char) {
+                add(String(char), .secondaryLabelColor)
+                // `&` right after a redirection is part of it, not a break.
+                if !(char == "&" && index > 0 && (chars[index - 1] == ">" || chars[index - 1] == "<")) {
+                    starting = true
+                }
                 index += 1
                 continue
             }
@@ -577,15 +676,31 @@ final class Controller: NSObject {
                 continue
             }
             var end = index
-            while end < chars.count, !stops.contains(chars[end]) { end += 1 }
+            // A backslash holds the next character inside the word, spaces of a
+            // path included: `Visual\ Studio\ Code.app` is one word.
+            while end < chars.count, !stops.contains(chars[end]) {
+                end += chars[end] == "\\" ? 2 : 1
+            }
+            end = min(end, chars.count)
             let word = String(chars[index..<end])
             if word.hasPrefix("-") {
                 add(word, .labelColor)
             } else if word.hasPrefix("$") {
                 add(word, .systemPurple)
             } else if starting {
-                add(word, .systemTeal, strong)
-                starting = false
+                // The same colours the list above uses: red is what has not
+                // been allowed, and everything else is the colour a command
+                // always has here.
+                // A word that is only a descriptor left over from `2>&1`, or an
+                // assignment in front of the command, is not the command.
+                if word.allSatisfy({ $0.isNumber }) || word.contains("=") {
+                    add(word, bodyColor)
+                } else {
+                    let name = word.split(separator: "/").last.map(String.init)?
+                        .replacingOccurrences(of: "\\", with: "") ?? word
+                    add(word, commandStatus[name] == false ? .systemRed : .systemTeal, strong)
+                    starting = false
+                }
             } else {
                 add(word, bodyColor)
             }

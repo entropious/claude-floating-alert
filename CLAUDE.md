@@ -15,9 +15,14 @@ shipped inside the `.vsix`.
 They meet in `~/.claude/floating-alert/`, which the extension fills on
 activation: the hook script, the binary, `config.json` (settings mirrored for
 the hook), `focus/<pid>.json` (one per window), `run/<session>.json` (one per
-live alert), `ask/<pid>.json` (what a clicked alert wants of one window) and
+live alert), `ask/<pid>.json` (what a clicked alert wants of one window),
+`rules.json` (the allow rules of the settings files, parsed once) and
 `log.jsonl` (one line per event, with what the decision was made on). The path
 is stable across extension updates, which is the point.
+
+What a `Bash` permission alert says about the command it carries — the list of
+commands above it, what each is named, and what the colours mean — is spelled
+out in [`docs/command-colours.md`](docs/command-colours.md).
 
 ## A click goes to a window by name
 

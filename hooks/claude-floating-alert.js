@@ -31,6 +31,8 @@ const CONFIG_FILE = path.join(ROOT, "config.json");
 const ASK_DIR = path.join(ROOT, "ask");
 /** The same request as a link, for when no window could be named. */
 const REVEAL_URL = "vscode://entro.claude-floating-alert/reveal";
+/** The Bash rules of the settings files, as they were when last read. */
+const RULES_FILE = path.join(ROOT, "rules.json");
 /**
  * One line per event, and what the decision was made on. An alert that should
  * not have appeared — or one that never did — leaves nothing else behind: the
@@ -106,6 +108,12 @@ function truncate(value, max) {
 /** As much text as the panel can wrap across its five body lines. */
 const BODY_MAX = 300;
 /**
+ * How much of a rule stands for a command in the list. The rule may spell out
+ * a whole invocation — the point is the command and what narrows it, `git
+ * status`, not the flags that follow.
+ */
+const LABEL_WORDS = 2;
+/**
  * As much of a command as the panel takes when unfolded. It shows the first
  * lines of it and grows to the rest on a click, so what goes across is the
  * whole thing — line breaks and all, since a command is read by its shape.
@@ -116,6 +124,227 @@ const COMMAND_MAX = 2000;
 function clip(value, max) {
   const text = String(value || "").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/**
+ * The commands a shell line runs, in order and without their arguments, each
+ * with whether it is one the user has already allowed.
+ *
+ * What is asked for is often a whole pipeline, and its first words are what
+ * says whether it is routine or not — reading that off five wrapped lines of a
+ * command takes longer than the answer is worth.
+ */
+function commandsIn(command, cwd) {
+  const rules = allowRules(cwd);
+  const seen = new Map();
+  const found = [];
+  // Everything that ends one command and starts another. Quotes are left
+  // alone: a separator inside them belongs to an argument, not to the line.
+  for (const piece of splitCommands(String(command || ""))) {
+    const words = commandWords(piece);
+    // A line may set variables before what it runs: `FOO=bar npm test`.
+    while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) words.shift();
+    if (words.length === 0) continue;
+    const name = path.basename(words[0]);
+    if (!name) continue;
+    // Named the way the rule that allows it is written: what stands in the
+    // settings is `git status`, and calling it `git` would promise more than
+    // has been allowed. Without a rule the bare command is all there is.
+    const rule = rules.find((one) => matchesRule(piece.trim(), one));
+    const label = rule ? ruleLabel(rule) : name;
+    // One name, one place in the list, and the line is only as settled as its
+    // least settled use of it.
+    const already = seen.get(label);
+    if (already) {
+      already.allowed = already.allowed && Boolean(rule);
+      continue;
+    }
+    const one = { name: label, allowed: Boolean(rule) };
+    seen.set(label, one);
+    found.push(one);
+  }
+  // What has not been allowed goes first: that is the part of the line the
+  // answer hangs on, and the allowed ones are there for completeness.
+  return [...found.filter((one) => !one.allowed), ...found.filter((one) => one.allowed)];
+}
+
+/**
+ * Splits a shell line on what separates one command from the next.
+ *
+ * Quotes and backslashes are left alone: a separator inside them belongs to an
+ * argument, not to the line. Nor is every `&` a separator — the one in `2>&1`
+ * names a file descriptor, and splitting there left `1` looking like a command.
+ */
+function splitCommands(line) {
+  const pieces = [];
+  let piece = "";
+  let quote = "";
+  for (let at = 0; at < line.length; at += 1) {
+    const char = line[at];
+    if (quote) {
+      if (char === quote) quote = "";
+      piece += char;
+      continue;
+    }
+    if (char === "\\") {
+      piece += char + (line[at + 1] || "");
+      at += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      piece += char;
+      continue;
+    }
+    if ("|&;\n(){}".includes(char)) {
+      if (char === "&" && /[<>]\s*$/.test(piece)) {
+        piece += char;
+        continue;
+      }
+      pieces.push(piece);
+      piece = "";
+      continue;
+    }
+    piece += char;
+  }
+  pieces.push(piece);
+  return pieces;
+}
+
+/**
+ * The words of one command, with what the shell would have taken off already
+ * taken off: a backslash before a space holds the word together — a path like
+ * `/Applications/Visual\ Studio\ Code.app/…` is one word — and redirections
+ * belong to no command at all.
+ */
+function commandWords(piece) {
+  const words = [];
+  let word = "";
+  let quote = "";
+  const keep = () => {
+    if (word) words.push(word);
+    word = "";
+  };
+  for (let at = 0; at < piece.length; at += 1) {
+    const char = piece[at];
+    if (quote) {
+      if (char === quote) quote = "";
+      else word += char;
+      continue;
+    }
+    if (char === "\\") {
+      word += piece[at + 1] || "";
+      at += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      keep();
+      continue;
+    }
+    word += char;
+  }
+  keep();
+  // `2>&1`, `> out.txt`, `< in`: the redirection itself, and the file it names.
+  const out = [];
+  for (let at = 0; at < words.length; at += 1) {
+    if (/^\d*[<>]/.test(words[at])) {
+      if (/[<>]$/.test(words[at])) at += 1;
+      continue;
+    }
+    out.push(words[at]);
+  }
+  return out;
+}
+
+/**
+ * The Bash rules the user has allowed, from every settings file Claude Code
+ * reads: their own, this project's, and the local overrides of each.
+ */
+function allowRules(cwd) {
+  const files = [
+    path.join(HOME, ".claude", "settings.json"),
+    path.join(HOME, ".claude", "settings.local.json"),
+    ...(cwd ? [path.join(cwd, ".claude", "settings.json"), path.join(cwd, ".claude", "settings.local.json")] : []),
+  ];
+  // Parsed once and kept: settings change rarely, and every event would
+  // otherwise read and walk four files to learn the same thing again. What is
+  // checked each time is only when each file was last written.
+  const kept = readJson(RULES_FILE) || {};
+  const rules = [];
+  let changed = false;
+  for (const file of files) {
+    let at = 0;
+    try {
+      at = fs.statSync(file).mtimeMs;
+    } catch {}
+    const known = kept[file];
+    if (known && known.at === at) {
+      rules.push(...known.rules);
+      continue;
+    }
+    const found = bashRules(file);
+    kept[file] = { at, rules: found };
+    rules.push(...found);
+    changed = true;
+  }
+  if (changed) {
+    try {
+      fs.mkdirSync(ROOT, { recursive: true });
+      fs.writeFileSync(RULES_FILE, JSON.stringify(kept));
+    } catch {}
+  }
+  return rules;
+}
+
+/** The Bash rules of one settings file. */
+function bashRules(file) {
+  const settings = readJson(file);
+  if (!settings) return [];
+  const rules = [];
+  for (const rule of (settings.permissions || {}).allow || []) {
+    const match = /^Bash\((.*)\)$/.exec(String(rule));
+    if (match) rules.push(match[1]);
+  }
+  return rules;
+}
+
+/**
+ * A JSON file, parsed once. The same settings are asked about for every command
+ * of a line, and reading four files apiece is work with one answer.
+ */
+const parsed = new Map();
+
+function readJson(file) {
+  if (parsed.has(file)) return parsed.get(file);
+  let value = null;
+  try {
+    value = JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {}
+  parsed.set(file, value);
+  return value;
+}
+
+/**
+ * How a rule reads in the list: the command and what narrows it, `git status`.
+ * The rest of the rule is flags and paths, and they are in the line below.
+ */
+function ruleLabel(rule) {
+  return rule
+    .replace(/\*$/, "")
+    .trim()
+    .split(/\s+/)
+    .slice(0, LABEL_WORDS)
+    .join(" ");
+}
+
+/** Whether one command matches an allow rule, which may end in a wildcard. */
+function matchesRule(command, rule) {
+  if (!rule.endsWith("*")) return command === rule;
+  return command.startsWith(rule.slice(0, -1).trimEnd());
 }
 
 /** Human-readable summary of what the tool is about to do. */
@@ -727,6 +956,14 @@ function main(kind, input, agent) {
   }
 
   const { subtitle, title, body } = compose(kind, input, agent);
+  // The commands of a shell line, said plainly above it: what is being asked
+  // for, and how much of it the user has already allowed.
+  const commands =
+    kind === "permission" && input.tool_name === "Bash"
+      ? about("which commands are asked for", [], () =>
+          commandsIn((input.tool_input || {}).command, cwd)
+        )
+      : [];
   const inTab = about(
     "which surface holds the chat",
     false,
@@ -779,6 +1016,8 @@ function main(kind, input, agent) {
       "--subtitle", subtitle,
       "--title", title,
       "--body", [body, ...troubles].filter(Boolean).join("\n⚠ "),
+      // Allowed ones are marked apart from the rest: the panel colours them.
+      "--commands", commands.map((one) => `${one.allowed ? "+" : "-"}${one.name}`).join(","),
       "--accent", config.accent,
       "--timeout", String(config.timeout),
       "--folder", windowFolder(cwd, session),

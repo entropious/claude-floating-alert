@@ -84,6 +84,14 @@ function makeHome(options) {
     );
   }
 
+  // The rules the user has allowed, read from the settings of their own home.
+  if (options.allow) {
+    fs.writeFileSync(
+      path.join(home, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { allow: options.allow } })
+    );
+  }
+
   // The transcript is what the tab-label fallback matches against.
   const projects = path.join(home, ".claude", "projects", CWD.replace(/[/.]/g, "-"));
   fs.mkdirSync(projects, { recursive: true });
@@ -222,6 +230,45 @@ test("a question asked through the permission hook stays a question", () => {
   });
   assert.strictEqual(flag(args, "--accent"), "purple");
   assert.strictEqual(flag(args, "--body"), "Which database?");
+});
+
+test("lists the commands of the line, allowed ones apart", () => {
+  const args = runHook("permission", {
+    focused: false,
+    allow: ["Bash(git status*)", "Bash(ls *)"],
+    payload: {
+      tool_name: "Bash",
+      tool_input: { command: 'git status --short && rm -rf build | ls -la "a;b"' },
+    },
+  });
+  assert.strictEqual(flag(args, "--commands"), "-rm,+git status,+ls");
+});
+
+test("reads past redirections and escaped spaces", () => {
+  const args = runHook("permission", {
+    focused: false,
+    allow: ["Bash(npm test*)"],
+    payload: {
+      tool_name: "Bash",
+      tool_input: {
+        command:
+          'npm test 2>&1 | tail -3 && /Applications/Visual\\ Studio\\ Code.app/Contents/Resources/app/bin/code --force > out.txt',
+      },
+    },
+  });
+  assert.strictEqual(flag(args, "--commands"), "-tail,-code,+npm test");
+});
+
+test("names a command as the rule that allows it is written", () => {
+  const args = runHook("permission", {
+    focused: false,
+    allow: ["Bash(git status*)"],
+    payload: {
+      tool_name: "Bash",
+      tool_input: { command: "git status && git push --force && git status" },
+    },
+  });
+  assert.strictEqual(flag(args, "--commands"), "-git,+git status");
 });
 
 test("offers to answer where a window says it can", () => {
