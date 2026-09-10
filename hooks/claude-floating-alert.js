@@ -108,11 +108,17 @@ function truncate(value, max) {
 /** As much text as the panel can wrap across its five body lines. */
 const BODY_MAX = 300;
 /**
- * How much of a rule stands for a command in the list. The rule may spell out
- * a whole invocation — the point is the command and what narrows it, `git
- * status`, not the flags that follow.
+ * Commands whose second word is a subcommand rather than an argument: `git add`
+ * and `git commit` are different things, and one word says nothing about which
+ * was asked for. For everything else the second word is a file or a flag, and
+ * it has no place in a name.
  */
-const LABEL_WORDS = 2;
+const SUBCOMMANDED = new Set([
+  "git", "npm", "npx", "yarn", "pnpm", "bun", "deno",
+  "docker", "kubectl", "helm", "cargo", "go", "gh", "brew",
+  "pip", "pip3", "apt", "apt-get", "systemctl", "launchctl",
+  "aws", "gcloud", "terraform", "dotnet", "mvn", "gradle", "tuist",
+]);
 /**
  * As much of a command as the panel takes when unfolded. It shows the first
  * lines of it and grows to the rest on a click, so what goes across is the
@@ -149,9 +155,12 @@ function commandsIn(command, cwd) {
     if (!name) continue;
     // Named the way the rule that allows it is written: what stands in the
     // settings is `git status`, and calling it `git` would promise more than
-    // has been allowed. Without a rule the bare command is all there is.
+    // has been allowed. Without a rule the command names itself — with its
+    // subcommand where it has one, since `git add` and `git commit` are not
+    // the same request.
     const rule = rules.find((one) => matchesRule(piece.trim(), one));
-    const label = rule ? ruleLabel(rule) : name;
+    const subcommand = rule ? "" : subcommandOf([name, ...words.slice(1)]);
+    const label = rule ? ruleLabel(rule) : subcommand ? `${name} ${subcommand}` : name;
     // One name, one place in the list, and the line is only as settled as its
     // least settled use of it.
     const already = seen.get(label);
@@ -175,6 +184,36 @@ function commandsIn(command, cwd) {
  * argument, not to the line. Nor is every `&` a separator — the one in `2>&1`
  * names a file descriptor, and splitting there left `1` looking like a command.
  */
+/**
+ * Skips a heredoc whole and says where it ended.
+ *
+ * The label stands right after the `<<`, quoted or not; the body starts on the
+ * next line and runs to a line holding the label alone. An unterminated heredoc
+ * swallows the rest, which is what it does when run.
+ */
+function skipHeredoc(text, from) {
+  let at = from + 2;
+  if (text[at] === "-") at += 1;
+  while (text[at] === " " || text[at] === "\t") at += 1;
+
+  let quote = "";
+  if (text[at] === "'" || text[at] === '"') {
+    quote = text[at];
+    at += 1;
+  }
+  const start = at;
+  while (at < text.length && !/[\s;|&()<>]/.test(text[at]) && text[at] !== quote) at += 1;
+  const label = text.slice(start, at);
+  if (quote && text[at] === quote) at += 1;
+  if (!label) return at - 1;
+
+  const body = text.indexOf("\n", at);
+  if (body === -1) return text.length;
+  const rest = text.slice(body + 1);
+  const end = new RegExp(`^[ \\t]*${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*$`, "m").exec(rest);
+  return end ? body + 1 + end.index + end[0].length : text.length;
+}
+
 function splitCommands(line) {
   const pieces = [];
   let piece = "";
@@ -194,6 +233,15 @@ function splitCommands(line) {
     if (char === '"' || char === "'") {
       quote = char;
       piece += char;
+      continue;
+    }
+    // The body of a heredoc is fed to a command, not run: its words look like
+    // any others and would fill the list with the prose of a commit message.
+    // The command it is fed to ends at it.
+    if (char === "<" && line[at + 1] === "<") {
+      at = skipHeredoc(line, at);
+      pieces.push(piece);
+      piece = "";
       continue;
     }
     if ("|&;\n(){}".includes(char)) {
@@ -329,16 +377,26 @@ function readJson(file) {
 }
 
 /**
- * How a rule reads in the list: the command and what narrows it, `git status`.
- * The rest of the rule is flags and paths, and they are in the line below.
+ * How a rule reads in the list: the way it is written, whole. It is the rule
+ * that allowed the command, and a rule cut short says less than it is — `npm
+ * run` does not name the script `Bash(npm run package*)` was written for, and
+ * reads as a permission that does not exist.
  */
 function ruleLabel(rule) {
-  return rule
-    .replace(/\*$/, "")
-    .trim()
-    .split(/\s+/)
-    .slice(0, LABEL_WORDS)
-    .join(" ");
+  return rule.replace(/\*$/, "").trim();
+}
+
+/**
+ * The subcommand of a command that has them: the first word after the name that
+ * names an action rather than a file. Flags are passed over along with what they
+ * take — `git -C .. push` still pushes.
+ */
+function subcommandOf(words) {
+  if (!SUBCOMMANDED.has(words[0])) return "";
+  for (let at = 1; at < words.length; at += 1) {
+    if (/^[A-Za-z][\w-]*$/.test(words[at])) return words[at];
+  }
+  return "";
 }
 
 /** Whether one command matches an allow rule, which may end in a wildcard. */

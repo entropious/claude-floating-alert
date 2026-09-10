@@ -82,6 +82,14 @@ let TROUBLE_MARK = "\u{26A0} "
 /// What the hook puts between the tool and what it is about to do.
 let TOOL_MARK = " \u{00B7} "
 
+/// A command the rules already allow: the colour a command has anyway, so that
+/// only what is being asked about stands out.
+let COMMAND_ALLOWED = NSColor(srgbRed: 0.38, green: 0.69, blue: 0.94, alpha: 1)
+/// A command no rule allows — what the request is being shown for.
+let COMMAND_ASKED = NSColor(srgbRed: 1.0, green: 0.55, blue: 0.53, alpha: 1)
+/// Nothing in the line is new: the whole of it has been allowed already.
+let COMMAND_SETTLED = NSColor(srgbRed: 0.60, green: 0.76, blue: 0.47, alpha: 1)
+
 func accentColor(_ name: String) -> NSColor {
     switch name {
     case "orange": return .systemOrange
@@ -547,20 +555,71 @@ final class Controller: NSObject {
         return out
     }
 
-    /// Whether each command of the line has been allowed, by the word it starts
-    /// with. A name that stands for both an allowed use and one that is not —
-    /// `git status` beside `git push` — counts as not allowed: the colour in
-    /// the line cannot tell the two apart, and red is the honest half.
+    /// Whether each command of the line has been allowed, under the name the
+    /// list above gives it — `git status` and `git push` are separate entries
+    /// there and separate answers here, so one name used both ways does not have
+    /// to settle on a single colour.
     private lazy var commandStatus: [String: Bool] = {
         var status: [String: Bool] = [:]
         for one in opts.commands.split(separator: ",") where one.count > 1 {
-            let label = String(one.dropFirst())
-            guard let word = label.split(separator: " ").first.map(String.init) else { continue }
-            let allowed = one.hasPrefix("+")
-            status[word] = (status[word] ?? true) && allowed
+            status[String(one.dropFirst())] = one.hasPrefix("+")
         }
         return status
     }()
+
+    /// Which words of a command the list named, and whether it allowed them.
+    /// Nil where the list says nothing about this command.
+    ///
+    /// The words of a rule stand next to each other, so they are looked for as a
+    /// run, longest first: `npm run package` is a different answer from `npm
+    /// run`. A subcommand need not stand next to the name — `git -C .. push` is
+    /// still `git push` — so that is looked for separately.
+    private func verdict(_ words: [String]) -> (marks: Set<Int>, allowed: Bool)? {
+        var count = min(words.count, 4)
+        while count > 0 {
+            if let allowed = commandStatus[words.prefix(count).joined(separator: " ")] {
+                return (Set(0..<count), allowed)
+            }
+            count -= 1
+        }
+        for at in 1..<max(words.count, 1) where words[at].range(of: "^[A-Za-z][\\w-]*$", options: .regularExpression) != nil {
+            if let allowed = commandStatus["\(words[0]) \(words[at])"] {
+                return ([0, at], allowed)
+            }
+            break
+        }
+        return nil
+    }
+
+    /// The words of the command starting at `from`, up to what ends it, each with
+    /// where it begins. The name is read as the list reads it: a program given by
+    /// path is named by its last component.
+    private func wordsAhead(_ chars: [Character], _ from: Int) -> [(text: String, start: Int)] {
+        let breaks = Set("|&;\n(){}")
+        let stops = Set(" \t\n|&;(){}<>\"'")
+        var words: [(text: String, start: Int)] = []
+        var at = from
+        while at < chars.count, !breaks.contains(chars[at]) {
+            if chars[at] == " " || chars[at] == "\t" {
+                at += 1
+                continue
+            }
+            if chars[at] == "\"" || chars[at] == "'" || chars[at] == "<" || chars[at] == ">" { break }
+            var end = at
+            while end < chars.count, !stops.contains(chars[end]) {
+                end += chars[end] == "\\" ? 2 : 1
+            }
+            end = min(end, chars.count)
+            var word = String(chars[at..<end])
+            if words.isEmpty {
+                word = word.split(separator: "/").last.map(String.init)?
+                    .replacingOccurrences(of: "\\", with: "") ?? word
+            }
+            words.append((word, at))
+            at = end
+        }
+        return words
+    }
 
     /// The tool the hook named in front of the command, when there is a list to
     /// carry it. Empty otherwise, and then the body keeps it.
@@ -585,15 +644,16 @@ final class Controller: NSObject {
         // The tool joins the list rather than heading the command: one line
         // says what is being asked for, the next is the line itself.
         if !toolName.isEmpty {
-            // Green where the whole line has already been allowed: one glance
-            // then says the request holds nothing new.
+            // Green where the whole line has already been allowed, red where
+            // anything in it is not: one glance then answers the request before
+            // the list is read at all.
             let settled = marked.allSatisfy { $0.hasPrefix("+") }
             out.append(
                 NSAttributedString(
                     string: "\(toolName): ",
                     attributes: [
                         .font: font,
-                        .foregroundColor: settled ? NSColor.systemGreen : NSColor.labelColor,
+                        .foregroundColor: settled ? COMMAND_SETTLED : COMMAND_ASKED,
                     ]
                 )
             )
@@ -606,7 +666,7 @@ final class Controller: NSObject {
                     string: String(one.dropFirst()),
                     attributes: [
                         .font: font,
-                        .foregroundColor: one.hasPrefix("+") ? NSColor.systemTeal : NSColor.systemRed,
+                        .foregroundColor: one.hasPrefix("+") ? COMMAND_ALLOWED : COMMAND_ASKED,
                     ]
                 )
             )
@@ -634,6 +694,10 @@ final class Controller: NSObject {
         // after one of them is a command again.
         let breaks = Set("|&;\n(){}")
         let stops = Set(" \t\n|&;(){}<>\"'")
+        // Where a word is coloured by the list's answer, and which answer. Filled
+        // in as each command is reached, so the line is lit exactly where the list
+        // above named something.
+        var marked: [Int: Bool] = [:]
         var starting = true
         var index = 0
         while index < chars.count {
@@ -683,22 +747,27 @@ final class Controller: NSObject {
             }
             end = min(end, chars.count)
             let word = String(chars[index..<end])
-            if word.hasPrefix("-") {
+            if let allowed = marked[index] {
+                // A word the list named: same colour there and here, so the two
+                // can be read against each other.
+                add(word, allowed ? COMMAND_ALLOWED : COMMAND_ASKED, strong)
+            } else if word.hasPrefix("-") {
                 add(word, .labelColor)
             } else if word.hasPrefix("$") {
                 add(word, .systemPurple)
             } else if starting {
-                // The same colours the list above uses: red is what has not
-                // been allowed, and everything else is the colour a command
-                // always has here.
                 // A word that is only a descriptor left over from `2>&1`, or an
                 // assignment in front of the command, is not the command.
                 if word.allSatisfy({ $0.isNumber }) || word.contains("=") {
                     add(word, bodyColor)
                 } else {
-                    let name = word.split(separator: "/").last.map(String.init)?
-                        .replacingOccurrences(of: "\\", with: "") ?? word
-                    add(word, commandStatus[name] == false ? .systemRed : .systemTeal, strong)
+                    let ahead = wordsAhead(chars, index)
+                    if let call = verdict(ahead.map { $0.text }) {
+                        for at in call.marks where at < ahead.count {
+                            marked[ahead[at].start] = call.allowed
+                        }
+                    }
+                    add(word, marked[index] == false ? COMMAND_ASKED : COMMAND_ALLOWED, strong)
                     starting = false
                 }
             } else {

@@ -268,7 +268,35 @@ test("names a command as the rule that allows it is written", () => {
       tool_input: { command: "git status && git push --force && git status" },
     },
   });
-  assert.strictEqual(flag(args, "--commands"), "-git,+git status");
+  // An allowed command is named by its whole rule; one nothing allows names its
+  // own subcommand, since "git" says nothing about which request it was.
+  assert.strictEqual(flag(args, "--commands"), "-git push,+git status");
+});
+
+test("names an allowed command by the whole rule, not a shortened one", () => {
+  const args = runHook("permission", {
+    focused: false,
+    allow: ["Bash(npm run package*)"],
+    payload: {
+      tool_name: "Bash",
+      tool_input: { command: "npm run package && npm run build" },
+    },
+  });
+  assert.strictEqual(flag(args, "--commands"), "-npm run,+npm run package");
+});
+
+test("reads a heredoc body as data rather than as commands", () => {
+  const args = runHook("permission", {
+    focused: false,
+    allow: [],
+    payload: {
+      tool_name: "Bash",
+      tool_input: {
+        command: "git commit -F - <<'EOF'\nrm -rf everything\ncurl a shell script\nEOF",
+      },
+    },
+  });
+  assert.strictEqual(flag(args, "--commands"), "-git commit");
 });
 
 test("offers to answer where a window says it can", () => {

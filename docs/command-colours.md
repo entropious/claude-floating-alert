@@ -16,26 +16,30 @@ kinds of event, and Codex keep the plain body they always had.
 - **The order.** What has not been allowed yet comes first, the allowed ones
   after. That first group is what the answer hangs on.
 - **How an entry is named.** Where a rule in the settings allows it, the entry
-  is named the way that rule is written, up to two words: `Bash(git status*)`
-  shows as `git status`. Where nothing allows it, the entry is the command
-  itself — `git`, whatever follows it.
-- **What the two words mean.** The command and what narrows it. The rest of a
-  rule is flags and paths, and those are in the line below.
+  is named the way that rule is written, whole: `Bash(npm run package*)` shows
+  as `npm run package`. A rule cut short says less than it is, and `npm run`
+  reads as a permission that does not exist.
+- **Where nothing allows it,** the entry is the command and its subcommand where
+  it has one — `git add`, `git commit`. One word says nothing about which
+  request it was. Commands without subcommands name themselves: `rm`, `curl`.
 
 ## The colours
 
 | | |
 |---|---|
 | red | not allowed by any rule |
-| teal | allowed, and anything the list says nothing about |
+| blue | allowed, and anything the list says nothing about |
 | brackets, commas | the plain text colour |
-| the tool's name | the plain text colour, and green when every entry is allowed |
+| the tool's name | green when every entry is allowed, red when any is not |
 
-The same colouring runs through the command below the list: the word a command
-starts with is red where it is not allowed and teal where it is. A name that
-stands for both — `git status` allowed beside `git push` that is not — is red in
-the line: the colour there cannot tell two uses apart, and red is the honest
-half. In the list they stay separate, `git` beside `git status`.
+The same colouring runs through the command below the list, on **the same words
+the list names**: where the list says `git push`, both words are red in the line;
+where it says `npm run package`, all three are blue. That is what makes the two
+readable against each other — the eye finds the entry without reading the line.
+
+A name used both ways — `git status` allowed beside a `git push` that is not —
+keeps its own colour in each place, because the answer is looked up under the
+name the list gave that command, not under its first word.
 
 The rest of the highlighting is unchanged: options in the bright text colour,
 quoted text green, variables purple, comments and the punctuation between
@@ -68,6 +72,12 @@ read again, the rest are not touched.
   skipped; the command is what follows them.
 - A command given by path is named by its last component: `/usr/bin/open` is
   `open`.
+- The body of a heredoc is data, not commands, and is skipped whole. The label
+  is taken from just after the `<<`, quoted or not; the body runs to a line
+  holding the label alone. `<<-` with an indented terminator counts, and an
+  unterminated one swallows the rest — which is what it does when run. The
+  command it is fed to ends at it.
+- A subcommand is looked for past the flags: `git -C .. push` is `git push`.
 
 ## Why it looks the way it does
 
