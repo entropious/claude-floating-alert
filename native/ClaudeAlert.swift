@@ -154,7 +154,11 @@ final class Controller: NSObject {
     /// has to be dismissible without going to the chat it came from.
     private var hasClose: Bool { opts.timeout <= 0 }
     /// Only where something on the other side can answer the request.
-    private var hasAccept: Bool { !opts.askFile.isEmpty && !opts.askAccept.isEmpty }
+    private var hasAccept: Bool {
+        !opts.askFile.isEmpty && !opts.askAccept.isEmpty && !acceptExpired
+    }
+    /// Whether the answer button has stood past its use.
+    private var acceptExpired = false
     /// Only where the alert has something to explain.
     private var hasLog: Bool { !opts.logFile.isEmpty }
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
@@ -419,6 +423,11 @@ final class Controller: NSObject {
     /// panel grows upwards from its corner, so nothing else on screen moves.
     @objc private func toggleExpanded() {
         expanded.toggle()
+        redraw()
+    }
+
+    /// Build the panel again from what is true now, keeping its corner.
+    private func redraw() {
         let container = content()
         container.layoutSubtreeIfNeeded()
         let height = max(container.fittingSize.height, minHeight)
@@ -430,6 +439,18 @@ final class Controller: NSObject {
             NSRect(x: frame.minX, y: frame.minY, width: width, height: height),
             display: true
         )
+    }
+
+    /// Takes the answer button away once the alert has stood long enough for
+    /// the request behind it to be anyone's guess.
+    ///
+    /// The window listens for the answer for a while after the event and then
+    /// stops; a button that outlives that listening promises an answer nobody
+    /// is waiting for. The panel itself stays — the event still happened.
+    @objc private func expireAccept() {
+        guard hasAccept else { return }
+        acceptExpired = true
+        redraw()
     }
 
     /// The row of answers along the bottom: what went wrong, and what can be
@@ -507,7 +528,10 @@ final class Controller: NSObject {
     /// Leave a request for the window holding the chat, which watches for it.
     private func ask(_ body: String) {
         guard !opts.askFile.isEmpty, !body.isEmpty else { return }
-        try? Data(body.utf8).write(to: URL(fileURLWithPath: opts.askFile))
+        // Written whole or not at all: the window watches that directory, and a
+        // file it finds empty because the writing is still going on is a
+        // request it cannot read.
+        try? Data(body.utf8).write(to: URL(fileURLWithPath: opts.askFile), options: .atomic)
     }
 
     /// The body of a permission alert, coloured where it is a shell command:
@@ -1037,7 +1061,14 @@ final class Controller: NSObject {
     /// code a click runs, so what is checked is the panel's own behaviour and
     /// not a copy of it.
     func listenForPress() {
-        for (number, act) in [(SIGUSR1, #selector(runAction)), (SIGUSR2, #selector(accept))] {
+        for (number, act) in [
+            (SIGUSR1, #selector(runAction)),
+            (SIGUSR2, #selector(accept)),
+            // The window has stopped listening for an answer, so the button
+            // that would send one goes away. The panel stays: the event it is
+            // about still happened.
+            (SIGHUP, #selector(expireAccept)),
+        ] {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
             source.setEventHandler { [weak self] in
@@ -1068,6 +1099,9 @@ let app = NSApplication.shared
 // .accessory: no Dock icon, no menu bar, and the panel never steals activation.
 app.setActivationPolicy(.accessory)
 let controller = Controller(opts: options)
-controller.show()
+// Before anything is drawn: until these are taken, either signal is a way to
+// kill the process outright, and one arriving early would take the panel with
+// it instead of pressing it.
 controller.listenForPress()
+controller.show()
 app.run()

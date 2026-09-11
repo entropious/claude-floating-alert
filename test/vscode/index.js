@@ -140,6 +140,51 @@ async function run() {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(commands.includes("claudeFloatingAlert.toggleHooks"));
     assert.ok(commands.includes("claudeFloatingAlert.test"));
+    assert.ok(commands.includes("claudeFloatingAlert.showLog"));
+  });
+
+  // What a clicked alert leaves for this window, and what becomes of it.
+  const askFile = path.join(ROOT, "ask", `${process.pid}.json`);
+  const leaveAsk = (text) => {
+    // The panel that leaves a request was raised by the hook, and the hook says
+    // so next door — which is what tells the window to start looking out for
+    // one. Writing only the request would be a panel nobody raised.
+    fs.mkdirSync(path.join(ROOT, "run"), { recursive: true });
+    fs.writeFileSync(
+      path.join(ROOT, "run", "test-session.json"),
+      JSON.stringify({ pid: process.pid, cwd: os.tmpdir(), kind: "permission" })
+    );
+    fs.mkdirSync(path.dirname(askFile), { recursive: true });
+    fs.writeFileSync(askFile, text);
+  };
+
+  await check("takes the request a clicked alert leaves", async () => {
+    leaveAsk(JSON.stringify({ action: "accept" }));
+    assert.ok(await until(() => !fs.existsSync(askFile), 5000), "the request should be taken");
+  });
+
+  await check("says on an alert of its own when the answer would not run", async () => {
+    const log = path.join(ROOT, "log.jsonl");
+    const before = fs.existsSync(log) ? fs.readFileSync(log, "utf-8") : "";
+    leaveAsk(JSON.stringify({ action: "accept" }));
+    await until(() => !fs.existsSync(askFile), 5000);
+    const written = await until(() => {
+      const now = fs.existsSync(log) ? fs.readFileSync(log, "utf-8") : "";
+      return now.length > before.length && now.slice(before.length).includes('"ask":"accept"');
+    }, 5000);
+    assert.ok(written, "the attempt should be written down");
+    const line = JSON.parse(fs.readFileSync(log, "utf-8").trim().split("\n").pop());
+    // Nothing here answers requests in a chat, so the command is missing — and
+    // that is the case the user is told about.
+    assert.strictEqual(line.ran, false, "a missing command is not a run one");
+  });
+
+  await check("leaves a half-written request alone until it is whole", async () => {
+    leaveAsk('{"action": "acce');
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.ok(fs.existsSync(askFile), "an unreadable request must not be thrown away");
+    leaveAsk(JSON.stringify({ action: "accept" }));
+    assert.ok(await until(() => !fs.existsSync(askFile), 5000), "and taken once it is whole");
   });
 
   await check("takes its hooks back out again, from both agents", async () => {
@@ -156,6 +201,21 @@ async function run() {
       assert.strictEqual(mine.length, 0, `the toggle should clear ${path.basename(file)}`);
     }
   });
+
+  // The alerts these checks caused are real panels, and the ones that wait for
+  // an answer wait for ever. They came from the sandbox copy of the binary,
+  // which is what names them here.
+  //
+  // Twice, a moment apart: a panel is started detached, and one asked for just
+  // now may not be running yet when the first sweep goes through.
+  for (const wait of [300, 1200]) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      require("child_process").execFileSync("pkill", ["-f", path.join(ROOT, "bin", "claude-alert")]);
+    } catch (e) {
+      /* none left on screen */
+    }
+  }
 
   say(failures.length ? `\n${failures.length} failed` : "\nall passed");
   if (failures.length) throw new Error(`${failures.length} extension host test(s) failed`);

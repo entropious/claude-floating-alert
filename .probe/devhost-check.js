@@ -301,6 +301,89 @@ async function press() {
 }
 
 /**
+ * Ответить с панели: нажать на висящем алерте кнопку ответа — её же кодом — и
+ * проверить, что из этого вышло.
+ *
+ * Ответ не виден со стороны: команда уходит внутрь чата. Зато окно записывает
+ * каждую исполненную просьбу в тот же лог, что и хук, и по этой записи видно и
+ * что просьба дошла, и что команда нашлась. Остальное — обещание кнопки: панель
+ * гаснет, и ни одно окно не выходит вперёд.
+ */
+async function accept() {
+  const line = alertLines()[0];
+  if (!line) {
+    console.log("FAIL  на экране нет алерта, отвечать нечего");
+    process.exitCode = 1;
+    return;
+  }
+  const pid = Number(line.trim().split(/\s+/)[0]);
+  const ask = (line.match(/--ask-accept (\{.*?\}) --/) || [])[1];
+  if (!ask) {
+    console.log("FAIL  алерт не предлагает ответа");
+    process.exitCode = 1;
+    return;
+  }
+  const front = (standWindow() || {}).pid;
+  const file = (line.match(/--ask-file (\S*)/) || [])[1] || "";
+  // По времени, а не по числу строк: лог подрезается, и счёт в нём сбивается.
+  const since = new Date().toISOString();
+  let written = false;
+  try {
+    process.kill(pid, "SIGUSR2");
+  } catch (error) {
+    console.log(`FAIL  алерт не принял ответ: ${error}`);
+    process.exitCode = 1;
+    return;
+  }
+  for (let waited = 0; waited < 8000; waited += 250) {
+    // Видеть просьбу на диске важно не меньше, чем ответ окна: «панель не
+    // написала» и «окно не прочло» — разные поломки, а следа они оставляют
+    // один и тот же.
+    if (file && fs.existsSync(file)) written = true;
+    const done = logLines()
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return {};
+        }
+      })
+      .find((entry) => entry.ask === "accept" && String(entry.at || "") >= since);
+    if (done) {
+      if (!done.ran) {
+        console.log("FAIL  команда ответа не отработала в окне");
+        process.exitCode = 1;
+        return;
+      }
+      if (!alive(pid) && (standWindow() || {}).pid === front) {
+        return console.log("  ok  ответ с панели");
+      }
+      console.log(
+        alive(pid) ? "FAIL  панель не погасла после ответа" : "FAIL  ответ увёл окна вперёд"
+      );
+      process.exitCode = 1;
+      return;
+    }
+    pause(250);
+  }
+  const now = file && fs.existsSync(file) ? "лежит непрочитанной" : "её нет";
+  console.log(
+    `FAIL  окно не отчиталось об ответе (просьба ${file || "—"}: ` +
+      `${written ? "панель написала" : "панель не писала"}, сейчас ${now})`
+  );
+  process.exitCode = 1;
+}
+
+/** Строки лога хука — того же, куда окна пишут исполненные просьбы. */
+function logLines() {
+  try {
+    return fs.readFileSync(path.join(ROOT, "log.jsonl"), "utf-8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Куда привёл щелчок: ждём, пока сессия окажется на экране, и говорим, в какой
  * поверхности. Ожидание короткое — окно уже поднято, речь про одну команду.
  */
@@ -591,8 +674,12 @@ async function focusTab(kind) {
     // Только группа, в которой лежит чат: в соседней он всё равно на экране, и
     // вкладка оттуда ничего бы не перекрыла.
     var groups = [].slice.call(document.querySelectorAll(".editor-group-container"));
+    // А если чата во вкладках нет вовсе — он в панели, — то любая группа, где
+    // вкладки есть: перекрывать нечего, но «поверх редактора код» значит то же.
     var group = groups.filter(function (candidate) {
       return [].slice.call(candidate.querySelectorAll(".tabs-container .tab")).some(isChat);
+    })[0] || groups.filter(function (candidate) {
+      return candidate.querySelectorAll(".tabs-container .tab").length > 0;
     })[0];
     if (!group) return "";
     var tabs = [].slice.call(group.querySelectorAll(".tabs-container .tab"));
@@ -1132,6 +1219,33 @@ function waitAnswer(session, seconds) {
 }
 
 /**
+ * Дождаться, пока Claude Code придумает чату название.
+ *
+ * По нему он подписывает вкладку, и без отчётов о поверхностях хук только по
+ * нему и узнаёт, чья это вкладка: пока названия нет, сессия во вкладке для него
+ * ничем не отличается от сессии в панели.
+ */
+function waitTitle(session, seconds) {
+  const file = path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    workspace().replace(/[/.]/g, "-"),
+    `${session}.jsonl`
+  );
+  for (let waited = 0; waited < seconds * 1000; waited += 500) {
+    try {
+      if (fs.readFileSync(file, "utf-8").includes('"ai-title"')) {
+        return console.log("название чата готово");
+      }
+    } catch {}
+    pause(500);
+  }
+  console.error(`за ${seconds} c чат так и не назвался: ${file}`);
+  process.exit(1);
+}
+
+/**
  * Сессия чата нужного вида — и только в окне стенда: чаты рабочего окна тоже
  * попадают в отчёты, и взятая оттуда сессия увела бы проверку в чужое окно.
  */
@@ -1614,6 +1728,9 @@ async function main() {
     case "wait-answer":
       waitAnswer(rest[0], Number(rest[1]) || 20);
       break;
+    case "wait-title":
+      waitTitle(rest[0], Number(rest[1]) || 60);
+      break;
     case "wait-codex":
       waitCodex(Number(rest[0]) || 30);
       break;
@@ -1654,6 +1771,9 @@ async function main() {
       break;
     case "press":
       await press();
+      break;
+    case "accept":
+      await accept();
       break;
     case "prefer":
       prefer(rest[0] === "panel" ? "panel" : "editor");

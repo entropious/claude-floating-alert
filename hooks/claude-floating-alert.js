@@ -937,13 +937,20 @@ function record(kind, input, agent) {
       troubles,
       windows,
     });
+    // Appended, not rewritten: the windows write their own lines here — what
+    // they were asked to do and whether it ran — and a rewrite would drop
+    // whatever landed between reading the file and writing it back.
+    fs.mkdirSync(ROOT, { recursive: true });
+    fs.appendFileSync(LOG_FILE, `${line}\n`);
+    // Cutting it back to size is the one rewrite there is, and it happens
+    // rarely enough that a line lost to it would be an old one.
     let kept = [];
     try {
       kept = fs.readFileSync(LOG_FILE, "utf-8").split("\n").filter(Boolean);
     } catch {}
-    kept.push(line);
-    fs.mkdirSync(ROOT, { recursive: true });
-    fs.writeFileSync(LOG_FILE, `${kept.slice(-LOG_LINES).join("\n")}\n`);
+    if (kept.length > LOG_LINES * 2) {
+      fs.writeFileSync(LOG_FILE, `${kept.slice(-LOG_LINES).join("\n")}\n`);
+    }
   } catch {}
 }
 

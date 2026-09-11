@@ -169,40 +169,144 @@ interface Ask {
  */
 function watchAsks(): vscode.Disposable {
   let watcher: fs.FSWatcher | undefined;
+  let poll: NodeJS.Timeout | undefined;
+  const look = (): void => {
+    const ask = takeAsk();
+    if (ask) void obey(ask);
+  };
+  // Watching a directory is not a promise: the system coalesces events and
+  // drops them under load, and a request nobody hears is a button that did
+  // nothing. So the file is also looked at now and then — but only while an
+  // alert could be on screen to press. The hook says when that is: it writes a
+  // file per panel it raises, next door. After a stretch with nothing new the
+  // looking stops, since the panel it was for is long answered or gone.
+  let until = 0;
+  const stop = (): void => {
+    if (poll) clearInterval(poll);
+    poll = undefined;
+    // The same moment, said to the panels: a button that outlives the listening
+    // promises an answer nobody is waiting for, so it goes when this does.
+    for (const alert of ownPanels()) {
+      try {
+        process.kill(alert.pid, "SIGHUP");
+      } catch {}
+    }
+  };
+  const arm = (): void => {
+    until = Date.now() + ASK_WATCH_MS;
+    if (poll) return;
+    poll = setInterval(() => {
+      look();
+      if (Date.now() > until) stop();
+    }, ASK_POLL_MS);
+  };
+  let alerts: fs.FSWatcher | undefined;
   try {
     fs.mkdirSync(ASK_DIR, { recursive: true });
+    fs.mkdirSync(RUN_DIR, { recursive: true });
     // A window that died with a request waiting would answer the moment it
     // comes back, long after the alert it belonged to.
-    takeAsk();
-    watcher = fs.watch(ASK_DIR, () => {
-      const ask = takeAsk();
-      if (ask) void obey(ask);
-    });
+    forgetAsk();
+    watcher = fs.watch(ASK_DIR, look);
+    alerts = fs.watch(RUN_DIR, arm);
   } catch {}
-  return { dispose: () => { watcher?.close(); takeAsk(); } };
+  return {
+    dispose: () => {
+      watcher?.close();
+      alerts?.close();
+      if (poll) clearInterval(poll);
+      forgetAsk();
+    },
+  };
 }
 
-/** Takes this window's request away, and says what it was. */
+/** How long a request can go unheard when the watcher misses it. */
+const ASK_POLL_MS = 1000;
+/**
+ * How long an alert stays worth looking out for after the hook raised one —
+ * the same stretch the panel offers its answer button for, since after that
+ * there is nothing left to press.
+ */
+const ASK_WATCH_MS = 5 * 60 * 1000;
+
+/**
+ * Takes this window's request away, and says what it was.
+ *
+ * The file goes only once it has been read whole: a watcher fires on the
+ * creation as readily as on the writing, and a request thrown away half-written
+ * is a button that did nothing. What cannot be parsed is left where it is, for
+ * the next look to find finished.
+ */
 function takeAsk(): Ask | null {
   let raw = "";
   try {
     raw = fs.readFileSync(ASK_FILE, "utf-8");
-    fs.unlinkSync(ASK_FILE);
   } catch {
     return null;
   }
+  let ask: Ask;
   try {
-    return JSON.parse(raw);
+    ask = JSON.parse(raw);
   } catch {
     return null;
   }
+  forgetAsk();
+  return ask;
+}
+
+function forgetAsk(): void {
+  try {
+    fs.unlinkSync(ASK_FILE);
+  } catch {}
 }
 
 async function obey(ask: Ask): Promise<void> {
   // Answering leaves everything where it is: the point of that button is to
   // take the first option without going to the chat at all.
-  if (ask.action === "accept") return run(ACCEPT_COMMAND);
+  if (ask.action === "accept") {
+    const ran = await run(ACCEPT_COMMAND);
+    // Written down because there is nothing else to see: the command answers
+    // inside a chat webview, and a button that did nothing looks exactly like
+    // one whose request never arrived.
+    note({ ask: "accept", command: ACCEPT_COMMAND, ran });
+    // And said out loud, since the alert is already gone and the request it was
+    // about is still waiting in the chat.
+    if (!ran) {
+      cry("Accept did not go through", `${ACCEPT_COMMAND} would not run in this window.`);
+    }
+    return;
+  }
   await reveal(ask.agent || "claude", ask.session || "", ask.tab === true);
+  note({ ask: "reveal", session: ask.session || "", tab: ask.tab === true });
+}
+
+/**
+ * Say on an alert of its own that something asked of this window did not
+ * happen. The panel that asked is gone by then — it closes on the press — and a
+ * notice inside the editor would be behind whatever the user went to instead.
+ */
+function cry(title: string, body: string): void {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  try {
+    execFile(BINARY, [
+      "--subtitle", folder ? path.basename(folder.uri.fsPath) : "Claude Code",
+      "--title", title,
+      "--body", body,
+      "--accent", "red",
+      "--timeout", "0",
+      "--log-file", path.join(INSTALL_DIR, "log.jsonl"),
+    ]);
+  } catch {}
+}
+
+/** One line in the log the hook keeps, about what this window was asked to do. */
+function note(what: Record<string, unknown>): void {
+  try {
+    fs.appendFileSync(
+      path.join(INSTALL_DIR, "log.jsonl"),
+      `${JSON.stringify({ at: new Date().toISOString(), window: process.pid, ...what })}\n`
+    );
+  } catch {}
 }
 
 /** Tell the hook script whether this window — not just VS Code — is focused. */
@@ -242,7 +346,7 @@ function isInside(cwd: string, folder: string): boolean {
  * Bring forward the chat a clicked alert asked for. Raising the window is the
  * alert's own doing; what is inside it belongs to whoever lives there.
  */
-async function reveal(agent: string, session: string, tab: boolean): Promise<void> {
+async function reveal(agent: string, session: string, tab: boolean): Promise<boolean> {
   if (agent === "codex") {
     // Codex takes no session anywhere: its panel opens on whatever chat it was
     // left on, which is the one the alert came from. The command reveals the
@@ -282,24 +386,29 @@ function revealHandler(): vscode.UriHandler {
 }
 
 /** Run a command of another extension, which may or may not be there. */
-async function run(command: string, ...args: unknown[]): Promise<void> {
+async function run(command: string, ...args: unknown[]): Promise<boolean> {
   try {
     await vscode.commands.executeCommand(command, ...args);
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Close the panels raised by sessions of this window: their alert is answered
  * by the user looking here. Panels of other windows stay up.
  */
-function dismissOwnPanels(): void {
+/** The panels raised by sessions of this window, by process. */
+function ownPanels(): { pid: number; file: string }[] {
   let files: string[] = [];
   try {
     files = fs.readdirSync(RUN_DIR);
   } catch {
-    return;
+    return [];
   }
   const folders = workspacePaths();
+  const mine: { pid: number; file: string }[] = [];
   for (const name of files) {
     const file = path.join(RUN_DIR, name);
     let panel: { pid?: number; cwd?: string; window?: string };
@@ -308,10 +417,17 @@ function dismissOwnPanels(): void {
     } catch {
       continue;
     }
-    const mine = WINDOW_ID && panel.window
+    const ours = WINDOW_ID && panel.window
       ? panel.window === WINDOW_ID
       : !!panel.cwd && folders.some((folder) => isInside(panel.cwd!, folder));
-    if (!mine || !panel.pid) continue;
+    if (ours && panel.pid) mine.push({ pid: panel.pid, file });
+  }
+  return mine;
+}
+
+function dismissOwnPanels(): void {
+  for (const panel of ownPanels()) {
+    const file = panel.file;
     try {
       process.kill(panel.pid, "SIGTERM");
     } catch {}

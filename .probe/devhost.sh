@@ -18,7 +18,11 @@
 #
 #   bash .probe/devhost.sh raise            дождаться, пока окно стенда в фокусе
 #   bash .probe/devhost.sh fire [kind]      прогнать хук: stop | permission | question
-#   bash .probe/devhost.sh case sidebars    два окна, в обоих только чат в панели
+#   bash .probe/devhost.sh case sidebar     два окна, в обоих чат в панели
+#   bash .probe/devhost.sh case tab         два окна, в обоих чат вкладкой
+#   bash .probe/devhost.sh case mixed       два окна, в обоих и панель, и вкладка
+#   bash .probe/devhost.sh case <имя> <кусок описания>
+#                                           только эти клетки, на уже поднятых окнах
 #
 #   Любой сценарий гоняется дважды: с патчем Claude Code (отчёты о поверхностях)
 #   и без него. Один вид профиля ставится вручную: flavour patched | plain.
@@ -26,9 +30,6 @@
 #   PROBE_FOCUS=real гонит фокус по-настоящему — окна выходят вперёд сами, и
 #   проверяется в том числе то, как расширение публикует фокус. Работать рядом
 #   в это время нельзя, поэтому по умолчанию фокус подделывается (pretend).
-#   bash .probe/devhost.sh case matrix      все сочетания панели, вкладок и двух окон
-#   bash .probe/devhost.sh case matrix <кусок описания>
-#                                           только эти клетки, на уже поднятом окне
 #
 #   bash .probe/devhost.sh codex            запускает ли Codex наши хуки (доверие)
 #   bash .probe/devhost.sh containers       какая панель выбрана в окне стенда
@@ -88,8 +89,15 @@ look_at() {
 		return 0
 	fi
 	if [ "$1" = "none" ]; then
-		# Ни одного окна редактора перед глазами — как когда ушли в браузер.
-		open -a Finder
+		# «Редактора перед глазами нет» — единственное место, где фокус всё-таки
+		# подделывается. По-настоящему увести его недолго, а вот вернуть нельзя:
+		# из фона приложение себя вперёд не выводит, это решает система по
+		# действию человека, и следующая клетка упиралась бы в это, а не в хук.
+		# Хук судит по тем же файлам окон, а проверка «щелчок вывел окно вперёд»
+		# в таких клетках и не спрашивается.
+		PROBE_CWD="$PROBE_CWD1" "${CHECK[@]}" pretend off > /dev/null
+		PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" pretend off > /dev/null
+		return 0
 	else
 		# Открытие уже открытой папки поднимает её окно и ничего не заводит.
 		"$CODE" "${ARGS[@]}" "$1" > /dev/null 2>&1
@@ -98,13 +106,24 @@ look_at() {
 	# Полсекунды сверху — редактору на то, чтобы разобраться с окнами: сразу
 	# после переключения он ещё не готов вывести вперёд соседнее окно по просьбе.
 	sleep 0.5
-	for _ in $(seq 1 20); do
+	for try in $(seq 1 40); do
 		sleep 0.3
 		if [ "$1" = "none" ]; then
 			"${CHECK[@]}" focus | grep -q "в фокусе" || return 0
 		else
 			"${CHECK[@]}" focus | grep "в фокусе" | grep -q "$(basename "$1")" && return 0
 		fi
+		# Занятый редактор глотает просьбу молча — сразу после ответа в чате он
+		# занят надолго, — поэтому просим снова, пока ждём.
+		case "$try" in
+		7|14|21|28) [ "$1" != "none" ] && "$CODE" "${ARGS[@]}" "$1" > /dev/null 2>&1 ;;
+		esac
+		# А когда редактора нет на экране вовсе — предыдущая клетка уводила взгляд
+		# в сторону, — сам он вперёд не выйдет: это решает система, и просить её
+		# приходится отдельно.
+		case "$try" in
+		10|20|30) [ "$1" != "none" ] && open -b com.microsoft.VSCode ;;
+		esac
 	done
 	echo "окно $1 так и не вышло вперёд"
 	return 1
@@ -370,10 +389,20 @@ hide-chat)
 	[ -n "${2:-}" ] && export PROBE_CWD="$2"
 	"${CHECK[@]}" hide-chat
 	;;
+# Вывести вперёд окно такой-то папки (или увести редактор целиком: none) и
+# дождаться, пока оно само об этом скажет.
+look)
+	look_at "${2:-$PROBE_CWD}"
+	;;
 # Нажать висящий алерт события такой-то папки — его же кодом.
 press)
 	[ -n "${2:-}" ] && export PROBE_CWD="$2"
 	"${CHECK[@]}" press
+	;;
+# Ответить с висящего алерта и проверить, что из этого вышло.
+accept)
+	[ -n "${2:-}" ] && export PROBE_CWD="$2"
+	"${CHECK[@]}" accept
 	;;
 # Выражение в главном фрейме окна такой-то папки — чтобы разбираться с разметкой
 # редактора, не угадывая её.
@@ -441,6 +470,37 @@ cell-state)
 	bash "$0" "$4-tab" || { echo "поверх редактора не встало: $4"; exit 1; }
 	;;
 
+# Один чат в окне — в панели или вкладкой, — и больше ничего. Печатает его
+# сессию; ею и стреляют события.
+seed-one)
+	export PROBE_CWD="$2"; kind="$3"
+	# Пока окно позади, редактор не рисует его вебвью и печатать в чат некуда.
+	"$CODE" "${ARGS[@]}" "$PROBE_CWD" > /dev/null 2>&1
+	sleep 1
+	# Настоящий файл, чтобы было чем перекрыть чат: несохранённая вкладка не даёт
+	# окну закрыться и оставляет «окно завершилось неожиданно».
+	echo "просто код, чтобы было чем перекрыть чат" > "$PROBE_CWD/code.txt"
+	if [ "$kind" = "sidebar" ]; then
+		bash "$0" panel-shown > /dev/null || exit 1
+		"${CHECK[@]}" ask claude "напиши слово один" > /dev/null || exit 1
+		session=$("${CHECK[@]}" wait-session sidebar 20) || exit 1
+		# Чему-то поверх редактора быть надо: клетки говорят «чат на экране» через
+		# то, что лежит сверху, а пустому редактору это сказать нечем.
+		"$CODE" "${ARGS[@]}" "$PROBE_CWD/code.txt" > /dev/null 2>&1; sleep 1
+	else
+		bash "$0" tab > /dev/null
+		"${CHECK[@]}" wait-surface tab 15 > /dev/null || exit 1
+		"${CHECK[@]}" ask claude-tab "напиши слово два" > /dev/null || exit 1
+		# Чат открывается соседней группой, и она заперта — код ушёл бы в первую,
+		# а чат остался бы на экране.
+		"${CHECK[@]}" unlock > /dev/null
+		"$CODE" "${ARGS[@]}" "$PROBE_CWD/code.txt" > /dev/null 2>&1; sleep 1
+		session=$("${CHECK[@]}" wait-session tab 25) || exit 1
+		bash "$0" panel-hidden > /dev/null || exit 1
+	fi
+	echo "$session" | tee "$ROOT/.probe/one-$kind-$(basename "$2")"
+	;;
+
 # Пара чатов в окне: один в панели, другой вкладкой, у каждого своя сессия.
 # Печатает их идентификаторы — по ним и стреляют события.
 seed)
@@ -493,6 +553,15 @@ cell)
 		"${CHECK[@]}" expect silence || exit 1
 	else
 		"${CHECK[@]}" expect alert || exit 1
+		# Ответ с панели — на том же алерте, поэтому первым: он её гасит, и
+		# событие поднимается заново для проверки щелчка. Кнопку даёт только
+		# окно с colorizer'ом, то есть профиль с патчем.
+		if [ "${PROBE_FLAVOUR:-patched}" = "patched" ]; then
+			"${CHECK[@]}" accept || exit 1
+			"${CHECK[@]}" forget > /dev/null
+			"${CHECK[@]}" fire permission "$session" > /dev/null
+			"${CHECK[@]}" expect alert || exit 1
+		fi
 		# Цель уводится с экрана до щелчка: иначе проверка сошлась бы и без него —
 		# сессия и так на месте, а щелчок мог не сработать вовсе.
 		#
@@ -550,19 +619,25 @@ case)
 			bash "$0" profile "$flavour" > /dev/null || exit 1
 			PROBE_FLAVOUR="$flavour" bash "$0" "$@" || status=1
 		done
+		# Прошло — за собой убираем: окна стенда, его чаты и записки прогона.
+		# Упало — оставляем всё как есть, иначе к упавшей клетке не вернуться.
+		if [ "$status" = 0 ]; then
+			bash "$0" stop > /dev/null
+			rm -f "$ROOT/.probe"/one-* "$ROOT/.probe"/seed*.log "$ROOT/.probe/matrix-state"
+			echo "== чисто: окна закрыты, чаты стенда убраны"
+		else
+			echo "== окна оставлены: bash .probe/devhost.sh case ${2:-} \"<кусок описания>\""
+		fi
 		exit "$status"
 	fi
 
 	# Сессии и панели копятся от прогона к прогону, и сценарий начинает смотреть
 	# на чужое состояние — поэтому каждый идёт со свежего окна.
 	#
-	# Кроме прогона одной клетки: `case matrix <кусок описания>` переиспользует
-	# уже поднятое окно и заведённые сессии, чтобы вернуться к упавшей клетке, а
-	# не гонять всю матрицу заново.
-	# Запомненные сессии годятся, только если их там все четыре: файл мог
-	# остаться от прежнего устройства матрицы.
-	if [ -n "${3:-}" ] && grep -q second_tab "$ROOT/.probe/matrix-state" 2>/dev/null; then
-		. "$ROOT/.probe/matrix-state"
+	# Кроме прогона одной клетки: `case <сценарий> <кусок описания>` берёт уже
+	# поднятые окна и заведённые чаты, чтобы вернуться к упавшей клетке, а не
+	# гонять сценарий заново.
+	if [ -n "${3:-}" ]; then
 		only="$3"
 	else
 		only=""
@@ -610,101 +685,133 @@ case)
 		bash "$0" fire permission "" codex > /dev/null
 		"${CHECK[@]}" expect alert "agent=codex" || exit 1
 		;;
-	sidebars)
-		# Самое простое, что бывает: два окна, в каждом чат в панели и ни одной
-		# вкладки. Пишут в панель своего окна — алерту взяться неоткуда.
-		echo "== два окна, в обоих открыт чат в панели"
-		for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
-			export PROBE_CWD="$folder"
-			# По очереди: пока окно позади, редактор не рисует его вебвью и печатать
-			# в чат некуда. Поднимает окно открытие его же папки.
-			"$CODE" "${ARGS[@]}" "$PROBE_CWD" > /dev/null 2>&1
-			sleep 1
-			bash "$0" panel-shown > /dev/null || exit 1
-			"${CHECK[@]}" ask claude "напиши слово один" > /dev/null || exit 1
-			session=$("${CHECK[@]}" wait-session sidebar 20) || exit 1
-			echo "$session" > "$ROOT/.probe/sidebar-$(basename "$folder")"
-			echo "-- $(basename "$folder"): панель ${session:0:8}"
-		done
+	accept)
+		# Ответ прямо с панели, на главных путях, где она всплывает: чат в
+		# панели и чат вкладкой, пользователь в соседнем окне и вовсе вне
+		# редактора. Кнопку даёт окно с colorizer'ом, поэтому только этот вид
+		# профиля.
+		echo "== ответ с панели"
+		bash "$0" seed "$PROBE_CWD1" > "$ROOT/.probe/seed-1.log" 2>&1 \
+			|| { echo "окно не засеялось:"; tail -3 "$ROOT/.probe/seed-1.log"; exit 1; }
+		seeded=$(cat "$ROOT/.probe/seed-$(basename "$PROBE_CWD1")")
+		in_panel=${seeded% *}; in_tab=${seeded#* }
+		echo "-- панель ${in_panel:0:8}, вкладка ${in_tab:0:8}"
 
-		# Оба чата ещё отвечают, и каждый закончит своим Stop — настоящий алерт
-		# посреди проверок.
-		for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
-			PROBE_CWD="$folder" "${CHECK[@]}" \
-				wait-answer "$(cat "$ROOT/.probe/sidebar-$(basename "$folder")")" 40 > /dev/null || exit 1
-		done
+		export PROBE_CWD="$PROBE_CWD1"
+		"${CHECK[@]}" wait-answer "$in_panel" 40 > /dev/null || exit 1
+		"${CHECK[@]}" wait-answer "$in_tab" 40 > /dev/null || exit 1
 		kill_alerts
 
-		for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
-			export PROBE_CWD="$folder"
-			session=$(cat "$ROOT/.probe/sidebar-$(basename "$folder")")
-			echo "-- событие из $(basename "$folder"), пользователь в нём же"
-			"${CHECK[@]}" forget > /dev/null
-			"${CHECK[@]}" pretend on > /dev/null
-			"${CHECK[@]}" surfaces
-			"${CHECK[@]}" fire permission "$session" > /dev/null
-			"${CHECK[@]}" expect silence || exit 1
+		# Второе окно должно быть готово до первой же проверки: расширение
+		# выбрасывает просьбу, пришедшую пока окно поднимается, и проверка
+		# упёрлась бы в это, а не в кнопку.
+		for _ in $(seq 1 30); do
+			PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" focus 2>/dev/null | grep -q "probe-2" && break
+			sleep 1
+		done
+
+		for here in second none; do
+			case "$here" in
+			second) at="$PROBE_CWD2" ;;
+			none)   at=none ;;
+			esac
+			for surface in sidebar tab; do
+				case "$surface" in
+				sidebar) session="$in_panel"; state="hidden" ;;
+				tab)     session="$in_tab";   state="shown" ;;
+				esac
+				echo "-- ответ на чат в ${surface}, пользователь в ${here}"
+				bash "$0" cell-state "$PROBE_CWD1" "$state" code \
+					|| { echo "не выставилось состояние"; exit 1; }
+				kill_alerts
+				"${CHECK[@]}" forget > /dev/null
+				look_at "$at" || exit 1
+				"${CHECK[@]}" fire permission "$session" > /dev/null
+				"${CHECK[@]}" expect alert || exit 1
+				"${CHECK[@]}" accept || exit 1
+			done
 		done
 		;;
-	matrix)
-		# Всё, от чего зависит судьба алерта: из какого окна пришло событие, где
-		# в этот момент пользователь, видна ли панель того окна и что у него
-		# поверх редактора. Сессий четыре — в каждом окне своя панель и своя
-		# вкладка, — и событие приходит от любой из них.
+	sidebar|tab|mixed)
+		# Что открыто в окнах, то и проверяется: только чат в панели, только чат
+		# вкладкой, или и то и другое разом. Окон всегда два, и событие приходит
+		# из каждого, пока пользователь то в нём самом, то в соседнем, то вовсе
+		# вне редактора.
 		#
 		# Тишина положена ровно тогда, когда пользователь в окне события и эта
-		# самая сессия у него на экране. Всё прочее — алерт, и тогда щелчок
+		# самая сессия у него на экране. Всё прочее — алерт: в профиле с
+		# colorizer'ом на нём сперва отвечают кнопкой, а затем — щелчок, который
 		# обязан привести в её окно и её поверхность.
-		echo "== матрица: два окна, четыре сессии"
+		kind="${2}"
+		case "$kind" in
+		sidebar) surfaces="sidebar"; echo "== два окна, чат в панели" ;;
+		tab)     surfaces="tab";     echo "== два окна, чат вкладкой" ;;
+		mixed)   surfaces="sidebar tab"; echo "== два окна, чат и в панели, и вкладкой" ;;
+		esac
+
 		if [ -n "$only" ]; then
 			echo "-- только клетки со словами: $only"
 		else
-			# По очереди: печатать можно только в то окно, что сейчас впереди.
-			# Зато ответы всех четырёх чатов ждутся потом разом.
-			bash "$0" seed "$PROBE_CWD1" > "$ROOT/.probe/seed-1.log" 2>&1 \
-				|| { echo "первое окно не засеялось:"; tail -3 "$ROOT/.probe/seed-1.log"; exit 1; }
-			bash "$0" seed "$PROBE_CWD2" > "$ROOT/.probe/seed-2.log" 2>&1 \
-				|| { echo "второе окно не засеялось:"; tail -3 "$ROOT/.probe/seed-2.log"; exit 1; }
-
-			seeded=$(cat "$ROOT/.probe/seed-$(basename "$PROBE_CWD1")")
-			first_sidebar=${seeded% *}; first_tab=${seeded#* }
-			echo "-- первое окно: панель ${first_sidebar:0:8}, вкладка ${first_tab:0:8}"
-
-			seeded=$(cat "$ROOT/.probe/seed-$(basename "$PROBE_CWD2")")
-			second_sidebar=${seeded% *}; second_tab=${seeded#* }
-			echo "-- второе окно: панель ${second_sidebar:0:8}, вкладка ${second_tab:0:8}"
-
-			# Все четыре чата ещё отвечают, и каждый закончит своим Stop —
-			# настоящий алерт посреди первых же проверок.
-			PROBE_CWD="$PROBE_CWD1" "${CHECK[@]}" wait-answer "$first_sidebar" 40 > /dev/null || exit 1
-			PROBE_CWD="$PROBE_CWD1" "${CHECK[@]}" wait-answer "$first_tab" 40 > /dev/null || exit 1
-			PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" wait-answer "$second_sidebar" 40 > /dev/null || exit 1
-			PROBE_CWD="$PROBE_CWD2" "${CHECK[@]}" wait-answer "$second_tab" 40 > /dev/null || exit 1
+			for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
+				for surface in $surfaces; do
+					bash "$0" seed-one "$folder" "$surface" > "$ROOT/.probe/seed.log" 2>&1 \
+						|| { echo "$(basename "$folder") не засеялось ($surface):"; tail -3 "$ROOT/.probe/seed.log"; exit 1; }
+					echo "-- $(basename "$folder"), $surface: $(cut -c1-8 < "$ROOT/.probe/one-$surface-$(basename "$folder")")"
+				done
+			done
+			# Чаты ещё отвечают, и каждый закончит своим Stop — настоящий алерт
+			# посреди первых же проверок.
+			for folder in "$PROBE_CWD1" "$PROBE_CWD2"; do
+				for surface in $surfaces; do
+					session=$(cat "$ROOT/.probe/one-$surface-$(basename "$folder")")
+					PROBE_CWD="$folder" "${CHECK[@]}" wait-answer "$session" 40 > /dev/null || exit 1
+					# И названия чата: без отчётов о поверхностях вкладку узнают
+					# только по нему, и до него сессия во вкладке неотличима от
+					# сессии в панели.
+					PROBE_CWD="$folder" "${CHECK[@]}" wait-title "$session" 60 > /dev/null || exit 1
+				done
+			done
 			kill_alerts
-
-			# Сессии запоминаются, чтобы к упавшей клетке можно было вернуться, не
-			# поднимая окна и не заводя чаты заново.
-			printf 'first_sidebar=%s\nfirst_tab=%s\nsecond_sidebar=%s\nsecond_tab=%s\n' \
-				"$first_sidebar" "$first_tab" "$second_sidebar" "$second_tab" \
-				> "$ROOT/.probe/matrix-state"
 		fi
+
+		# Со смешанным окном проверяется только то, чего в двух первых сценариях
+		# нет: две поверхности разом, где легко спутать, чей это чат. Значит
+		# пользователь всегда в окне события — в чужом окне обе сессии одинаково
+		# не на экране, и это уже проверено, — а на экране всегда та поверхность,
+		# которая не своя для события.
+		[ "$kind" = "mixed" ] && wheres="first" || wheres="first second none"
 
 		for from in first second; do
 			case "$from" in
-			first)  folder="$PROBE_CWD1"; in_panel="$first_sidebar";  in_tab="$first_tab" ;;
-			second) folder="$PROBE_CWD2"; in_panel="$second_sidebar"; in_tab="$second_tab" ;;
+			first)  folder="$PROBE_CWD1" ;;
+			second) folder="$PROBE_CWD2" ;;
 			esac
-
-			for here in first second none; do
+			for here in $wheres; do
+				# В смешанном сценарии пользователь всегда там же, откуда событие.
+				[ "$kind" = "mixed" ] && here="$from"
 				case "$here" in
 				first)  at="$PROBE_CWD1" ;;
 				second) at="$PROBE_CWD2" ;;
 				none)   at=none ;;
 				esac
-
-				for panel in shown hidden; do
-					for top in chat code; do
-						name="событие из ${from}, пользователь в ${here}, панель ${panel}, поверх ${top}"
+				for surface in $surfaces; do
+					session=$(cat "$ROOT/.probe/one-$surface-$(basename "$folder")")
+					# Состояние окна события: где чат этой сессии и видно ли его.
+					# У панели это она сама, у вкладки — что лежит поверх.
+					for state in on off; do
+						if [ "$surface" = "sidebar" ]; then
+							[ "$state" = on ] && panel=shown || panel=hidden
+							# В смешанном окне поверх редактора лежит чужой чат —
+							# вкладка соседней сессии: своей сессии она не своя, и
+							# принять её за неё как раз и есть чего бояться.
+							[ "$kind" = "mixed" ] && top=chat || top=code
+						else
+							# То же с другой стороны: панель открыта и показывает
+							# чат соседней сессии, а спрашивают про вкладку.
+							[ "$kind" = "mixed" ] && panel=shown || panel=hidden
+							[ "$state" = on ] && top=chat || top=code
+						fi
+						name="событие из ${from}, пользователь в ${here}, чат в ${surface} ${state}"
 						case "$name" in *"$only"*) ;; *) continue ;; esac
 						echo "-- $name"
 
@@ -713,19 +820,15 @@ case)
 						bash "$0" cell-state "$folder" "$panel" "$top" \
 							|| { echo "не выставилось состояние клетки"; exit 1; }
 						want=alert
-						[ "$here" = "$from" ] && [ "$panel" = shown ] && want=silence
+						[ "$here" = "$from" ] && [ "$state" = on ] && want=silence
 						# Без отчётов о поверхностях панель для расширения невидима
 						# вовсе: открыта она или спрятана, знать неоткуда, и окно
 						# перед глазами — единственное, на что тут можно опереться.
-						# Так было до отчётов и так остаётся, где их нет.
-						[ "${PROBE_FLAVOUR:-}" = "plain" ] && [ "$here" = "$from" ] && want=silence
-						bash "$0" cell "$at" "$folder" "$in_panel" "$want" sidebar || exit 1
-
-						bash "$0" cell-state "$folder" "$panel" "$top" \
-							|| { echo "не выставилось состояние клетки"; exit 1; }
-						want=alert
-						[ "$here" = "$from" ] && [ "$top" = chat ] && want=silence
-						bash "$0" cell "$at" "$folder" "$in_tab" "$want" tab || exit 1
+						if [ "${PROBE_FLAVOUR:-}" = "plain" ] && [ "$surface" = "sidebar" ] \
+							&& [ "$here" = "$from" ]; then
+							want=silence
+						fi
+						bash "$0" cell "$at" "$folder" "$session" "$want" "$surface" || exit 1
 					done
 				done
 			done
