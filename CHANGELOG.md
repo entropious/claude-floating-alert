@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.4
+
+- A click goes to the window holding the chat, whatever folder the session is
+  working in. `cd` inside a chat moves its working directory, and the click then
+  went to whichever window had that folder open.
+- A window that was merely told about a session no longer answers for it: it
+  took clicks meant for the window showing the chat, and, while focused, passed
+  for the chat being watched — so no alert appeared at all.
+
 ## 1.7.3
 
 - The alert draws on a solid background. Blended with the window behind it, the
