@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.3
+
+- The alert draws on a solid background. Blended with the window behind it, the
+  body text and the colours of the commands were unreadable over a light editor.
+
 ## 1.3.0
 
 - An alert that waits for an answer — a permission request or a question — now
