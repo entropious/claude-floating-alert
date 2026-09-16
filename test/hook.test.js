@@ -25,6 +25,9 @@ const SANDBOX = path.join(ROOT, ".tmp", "hook-test");
 
 const SESSION = "11111111-2222-3333-4444-555555555555";
 const CWD = "/tmp/project-under-test";
+/** The folder of the second window, open around no session of these tests. */
+const OTHER_CWD = "/tmp/another-project";
+const OTHER_PID = process.ppid;
 const TAB_TITLE = "Fix the parser";
 
 let failures = 0;
@@ -82,6 +85,36 @@ function makeHome(options) {
       path.join(dir, `${process.pid}.json`),
       JSON.stringify({ pid: process.pid, folders: [CWD], surfaces: options.presence })
     );
+  }
+
+  // A second window, for the questions only two of them can ask: which one holds
+  // the chat, and which one a click belongs to. Its pid is this process's parent
+  // — any live one will do, and the hook only asks whether it is still running.
+  if (options.other) {
+    const folders = options.other.folders || [OTHER_CWD];
+    fs.writeFileSync(
+      path.join(root, "focus", `${OTHER_PID}.json`),
+      JSON.stringify({
+        pid: OTHER_PID,
+        window: "",
+        focused: !!options.other.focused,
+        folders,
+        chatTabs: [],
+        activeChat: "",
+        codexTab: false,
+        accept: false,
+        state: "",
+        at: new Date().toISOString(),
+      })
+    );
+    if (options.other.presence) {
+      const dir = path.join(root, "presence");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, `${OTHER_PID}.json`),
+        JSON.stringify({ pid: OTHER_PID, folders, surfaces: options.other.presence })
+      );
+    }
   }
 
   // The rules the user has allowed, read from the settings of their own home.
@@ -405,6 +438,83 @@ test("links to the surface the session was last worked in", () => {
     ],
   });
   assert.match(flag(args, "--ask-click"), /"tab":false/, "the side bar was the later of the two");
+});
+
+test("sends the click to the window reporting the session, not the one on its folder", () => {
+  // Two windows, a chat in the side bar of each. The event comes from the chat
+  // of the second, whose folder is not the one the event carries.
+  const args = runHook("permission", {
+    focused: false,
+    presence: [{ session: "another-session", kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
+    other: {
+      focused: false,
+      presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
+    },
+  });
+  assert.ok(args, "an alert should have been raised");
+  assert.match(
+    flag(args, "--ask-file"),
+    new RegExp(`ask/${OTHER_PID}\\.json$`),
+    "the click went to the window that merely had the folder open"
+  );
+  assert.strictEqual(flag(args, "--folder"), OTHER_CWD, "the wrong window would be raised");
+});
+
+test("keeps the window of a session that is working in another project's folder", () => {
+  // `cd` inside a chat moves the session's working directory, and the window
+  // around it does not follow: the event then carries a folder belonging to a
+  // different window, while the chat is where it always was.
+  const args = runHook("permission", {
+    focused: false,
+    payload: { cwd: OTHER_CWD },
+    presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
+    other: { focused: false },
+  });
+  assert.ok(args, "an alert should have been raised");
+  assert.match(
+    flag(args, "--ask-file"),
+    new RegExp(`ask/${process.pid}\\.json$`),
+    "the click followed the working directory instead of the chat"
+  );
+  assert.strictEqual(flag(args, "--folder"), CWD, "the folder named is not the one around the chat");
+});
+
+test("passes over a window that only guessed at the session", () => {
+  // A report may carry a session a surface was told about rather than one it
+  // shows, marked as a guess. Here the second window guesses at the chat of the
+  // first, and its folder is the one the event carries — everything that could
+  // draw the click to it, short of actually holding the chat.
+  const args = runHook("permission", {
+    focused: false,
+    payload: { cwd: OTHER_CWD },
+    presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
+    other: {
+      focused: false,
+      presence: [
+        { session: SESSION, guessed: true, kind: "sidebar", chat: true, visible: true, activeAt: 3 },
+      ],
+    },
+  });
+  assert.ok(args, "an alert should have been raised");
+  assert.match(
+    flag(args, "--ask-file"),
+    new RegExp(`ask/${process.pid}\\.json$`),
+    "a guess took the click from the window that holds the chat"
+  );
+});
+
+test("does not call a chat watched on a guess", () => {
+  // The focused window guesses at a session whose chat is in the other one. A
+  // guess says nothing about what is on screen, so the alert stands.
+  const args = runHook("permission", {
+    focused: true,
+    presence: [{ session: SESSION, guessed: true, kind: "sidebar", chat: true, visible: true }],
+    other: {
+      focused: false,
+      presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 2 }],
+    },
+  });
+  assert.ok(args, "the guess passed for the chat being in front of the user");
 });
 
 console.log("with Codex as the agent");

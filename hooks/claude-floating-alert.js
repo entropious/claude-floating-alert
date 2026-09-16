@@ -656,7 +656,17 @@ function chatSurfaces(pid, all) {
   return all ? state.surfaces || [] : (state.surfaces || []).filter((surface) => surface.chat !== false);
 }
 
-/** The surfaces holding one session, across every reporting window. */
+/**
+ * The surfaces holding one session, across every reporting window — those that
+ * named the session themselves, and only those.
+ *
+ * A report may also carry a guess, marked as such: a surface told about a
+ * session it is not the one showing. Two windows then answer for the same chat,
+ * and since the reports are read in pid order, which is to say at random, a
+ * guess wins half the time — sending the click to a window that never held the
+ * chat, or calling it watched while the real one sits behind a browser. Nothing
+ * is decided on a guess; the log keeps them for when a decision looks wrong.
+ */
 function surfacesOf(sessionId, all) {
   if (!sessionId) return [];
   const found = [];
@@ -664,7 +674,7 @@ function surfacesOf(sessionId, all) {
     const surfaces = chatSurfaces(pid, all);
     if (!surfaces) continue;
     for (const surface of surfaces) {
-      if (surface.session === sessionId) found.push({ ...surface, pid });
+      if (surface.session === sessionId && !surface.guessed) found.push({ ...surface, pid });
     }
   }
   return found;
@@ -727,11 +737,18 @@ function reportedWatch(sessionId) {
  */
 function windowFolder(cwd, sessionId) {
   // A window that reports this very session holds the chat, whatever its
-  // folders say — the surest answer there is, when someone is reporting.
+  // folders say — the surest answer there is, when someone is reporting. The
+  // folder around the session is the one to name where the window has one, and
+  // any folder of that window will do where it has not: a session that moved
+  // into another project still lives in this window, and raising it is all the
+  // folder is for.
   for (const surface of surfacesOf(sessionId)) {
     const state = windowState(surface.pid);
-    const folder = state && (state.folders || []).find((candidate) => isInside(cwd, candidate));
-    if (folder) return folder;
+    if (!state) continue;
+    const folders = state.folders || [];
+    const around = folders.find((candidate) => isInside(cwd, candidate));
+    if (around) return around;
+    if (folders.length > 0) return folders[0];
   }
   // Nested folders can each be open in a window of their own — a sub-project, a
   // worktree — so the closest folder around the session is the right window.
@@ -753,11 +770,15 @@ function windowFolder(cwd, sessionId) {
  * sure answer, and without reports the closest folder around it wins.
  */
 function askWindow(cwd, sessionId) {
-  const windows = windowsFor(cwd);
+  // A window reporting this very session holds the chat, and its folders have no
+  // say in it: `cd` inside a chat moves the session's working directory, and a
+  // session working in another project's folder belongs to its window all the
+  // same. Matching the folders first sent those clicks to whichever window had
+  // the folder the session had wandered into.
   for (const surface of surfacesOf(sessionId)) {
-    const reporting = windows.find((state) => state.pid === surface.pid);
-    if (reporting) return reporting.pid;
+    if (windowState(surface.pid)) return surface.pid;
   }
+  const windows = windowsFor(cwd);
   let best = null;
   let closest = -1;
   for (const state of windows) {
@@ -921,7 +942,10 @@ let outcome = "";
 function record(kind, input, agent) {
   const cwd = input.cwd || "";
   try {
-    const windows = windowsFor(cwd).map((state) => ({
+    // Every live window, not only the ones whose folders fit the event: a
+    // decision that went to the wrong window is explained by the window that was
+    // passed over, and narrowing the record to the folder hides exactly that.
+    const windows = liveWindows().map((state) => ({
       ...state,
       surfaces: chatSurfaces(state.pid, true),
     }));
