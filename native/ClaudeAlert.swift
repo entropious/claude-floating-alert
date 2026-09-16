@@ -90,6 +90,11 @@ let COMMAND_ASKED = NSColor(srgbRed: 1.0, green: 0.55, blue: 0.53, alpha: 1)
 /// Nothing in the line is new: the whole of it has been allowed already.
 let COMMAND_SETTLED = NSColor(srgbRed: 0.60, green: 0.76, blue: 0.47, alpha: 1)
 
+/// The panel paints its own background instead of blending with whatever is
+/// behind it. The text and the command colours above are picked for a dark
+/// surface, and over a light window a translucent one leaves them unreadable.
+let PANEL_BACKGROUND = NSColor(srgbRed: 0.13, green: 0.13, blue: 0.14, alpha: 1)
+
 func accentColor(_ name: String) -> NSColor {
     switch name {
     case "orange": return .systemOrange
@@ -111,7 +116,7 @@ final class AlertPanel: NSPanel {
 }
 
 /// Background of the panel — the whole surface is the click target.
-final class ClickableEffectView: NSVisualEffectView {
+final class ClickableSurface: NSView {
     var onClick: (() -> Void)?
     /// The few things that answer clicks on their own; everything else is surface.
     var passthrough: [NSView] = []
@@ -193,15 +198,17 @@ final class Controller: NSObject {
         self.opts = opts
     }
 
-    private func content() -> ClickableEffectView {
+    private func content() -> ClickableSurface {
         let accent = accentColor(opts.accent)
 
-        let container = ClickableEffectView()
+        let container = ClickableSurface()
         container.onClick = { [weak self] in self?.runAction() }
-        container.material = .hudWindow
-        container.blendingMode = .behindWindow
-        container.state = .active
+        // Label and control colours resolve against the view they are drawn in,
+        // and on a dark surface they have to be the dark-mode ones whatever the
+        // rest of the system is set to.
+        container.appearance = NSAppearance(named: .darkAqua)
         container.wantsLayer = true
+        container.layer?.backgroundColor = PANEL_BACKGROUND.cgColor
         container.layer?.cornerRadius = 14
         container.layer?.cornerCurve = .continuous
         container.layer?.masksToBounds = true
