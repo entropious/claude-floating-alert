@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.0
+
+- A click brings the window forward and stops there. Which chat to show inside
+  it is no longer worked out here: a side bar is closed to every API, and the
+  ways around that — the titles of chat tabs matched against session
+  transcripts, the view container in the layout state, reports of what is on
+  screen — pointed at the wrong chat often enough to be worse than not pointing
+  at all. Gone with them: the `ask/<pid>.json` channel, the `vscode://` link and
+  the answer button, which needed that channel to answer anything.
+- The alert stays down only while a window with that folder is in front. A chat
+  in a background tab of a focused window therefore counts as watched and raises
+  nothing — the trade for never landing a click in someone else's chat.
+- A window publishes only its pid, socket, folders and focus. Chat tab titles,
+  the layout state and the rest are not read at all, and session transcripts are
+  never opened.
+- Codex is decided the same way, by the window in front; its panel and tabs are
+  no longer inspected either.
+
 ## 1.8.0
 
 - The panel draws text it is handed already coloured: `--body-html` for the

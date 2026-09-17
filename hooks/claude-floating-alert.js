@@ -16,21 +16,7 @@ const ROOT = path.join(HOME, ".claude", "floating-alert");
 const BINARY = path.join(ROOT, "bin", "claude-alert");
 const RUN_DIR = path.join(ROOT, "run");
 const FOCUS_DIR = path.join(ROOT, "focus");
-/** Optional: whether the chat is on screen, reported by a patched Claude Code. */
-const PRESENCE_DIR = path.join(ROOT, "presence");
 const CONFIG_FILE = path.join(ROOT, "config.json");
-/**
- * Where a clicked panel leaves what it wants done — reveal this chat, answer
- * this request — one file per window, named after its extension host.
- *
- * A deep link says the same thing, but goes to whichever window VS Code hands
- * it to: the last active one, which at the moment of a click is by definition
- * not the one with the chat, or there would have been no alert. That window
- * sees a folder that is not its own and does nothing.
- */
-const ASK_DIR = path.join(ROOT, "ask");
-/** The same request as a link, for when no window could be named. */
-const REVEAL_URL = "vscode://entro.claude-floating-alert/reveal";
 /** The Bash rules of the settings files, as they were when last read. */
 const RULES_FILE = path.join(ROOT, "rules.json");
 /**
@@ -71,15 +57,6 @@ function agentId(argv) {
   const id = at >= 0 ? argv[at + 1] : "";
   return Object.prototype.hasOwnProperty.call(AGENTS, id) ? id : "claude";
 }
-
-/** How much of a transcript's tail to scan for the session title. */
-const TITLE_SCAN_BYTES = 512 * 1024;
-
-/** How much of its head to scan for the first thing the user said. */
-const HEAD_SCAN_BYTES = 64 * 1024;
-
-/** Label a chat tab carries until Claude names the session. */
-const UNTITLED_TAB = "Claude Code";
 
 const DEFAULTS = {
   permission: { accent: "orange", timeout: 0 },
@@ -482,82 +459,6 @@ function isInside(cwd, folder) {
   return cwd === folder || cwd.startsWith(`${folder}${path.sep}`);
 }
 
-function readSlice(file, from, length) {
-  const fd = fs.openSync(file, "r");
-  try {
-    const buffer = Buffer.alloc(length);
-    const read = fs.readSync(fd, buffer, 0, length, from);
-    return buffer.subarray(0, read).toString("utf-8");
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-/**
- * What the chat tab of this session can be called. A tab starts out with the
- * default label, is renamed to the first thing the user said, and ends up with
- * the title Claude generates — and the transcript trails the tab, so all three
- * have to be considered.
- *
- * Null when the transcript cannot be read at all. A session with no marks and a
- * session nothing is known about look the same from here, and treating the
- * second as the first let any tab still carrying the default label pass for
- * this session's own — a side bar chat then counted as a tab in the background,
- * and answering in it raised an alert.
- */
-function sessionMarks(cwd, sessionId) {
-  if (!cwd || !sessionId) return null;
-  const file = path.join(HOME, ".claude", "projects", cwd.replace(/[/.]/g, "-"), `${sessionId}.jsonl`);
-  let head;
-  let tail;
-  try {
-    const { size } = fs.statSync(file);
-    head = readSlice(file, 0, Math.min(size, HEAD_SCAN_BYTES));
-    const from = Math.max(0, size - TITLE_SCAN_BYTES);
-    tail = from === 0 ? head : readSlice(file, from, size - from);
-  } catch {
-    return null;
-  }
-
-  let aiTitle = "";
-  // The entry is rewritten as the title changes, so the last one wins.
-  for (const line of tail.split("\n")) {
-    if (!line.includes('"ai-title"')) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === "ai-title" && entry.aiTitle) aiTitle = String(entry.aiTitle).trim();
-    } catch {}
-  }
-
-  let firstMessage = "";
-  for (const line of head.split("\n")) {
-    if (!line.includes('"type":"user"')) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type !== "user" || entry.isSidechain) continue;
-      const content = (entry.message || {}).content;
-      const text = typeof content === "string"
-        ? content
-        : (content || []).map((part) => (part && part.text) || "").join(" ");
-      firstMessage = text.replace(/\s+/g, " ").trim();
-      if (firstMessage) break;
-    } catch {}
-  }
-
-  return { aiTitle, firstMessage };
-}
-
-/** Whether a tab with this label belongs to the session behind these marks. */
-function tabBelongs(label, marks) {
-  const clean = label.replace(/…$/, "").trim();
-  if (!clean) return false;
-  if (marks.aiTitle && clean === marks.aiTitle) return true;
-  // A renamed-to-first-message tab: VS Code shows a shortened version of it.
-  if (marks.firstMessage && marks.firstMessage.startsWith(clean)) return true;
-  // The default label only counts while the chat has nothing to be named after.
-  return clean === UNTITLED_TAB && !marks.aiTitle && !marks.firstMessage;
-}
-
 /** Every VS Code window that is still running, whatever it has open. */
 function liveWindows() {
   let files = [];
@@ -597,16 +498,6 @@ function windowsFor(cwd) {
   return cwd ? live.filter((state) => (state.folders || []).some((f) => isInside(cwd, f))) : [];
 }
 
-/** What one VS Code window last published about itself, if it is still alive. */
-function windowState(pid) {
-  try {
-    const state = JSON.parse(fs.readFileSync(path.join(FOCUS_DIR, `${pid}.json`), "utf-8"));
-    return isAlive(state.pid) ? state : null;
-  } catch {
-    return null;
-  }
-}
-
 /** The focused VS Code window this session belongs to, if it is focused at all. */
 function focusedWindow(cwd) {
   for (const state of windowsFor(cwd)) {
@@ -616,290 +507,37 @@ function focusedWindow(cwd) {
 }
 
 /**
- * What a Claude Code patched with the presence payload says about the chats of
- * one window: one entry per surface, each naming its session, whether it is a
- * tab or the side bar, and whether it is on screen. The file is written by the
- * extension host of that window, which is the process the focus file names too.
+ * The folder to hand `open`, which brings forward the window that has it.
  *
- * Returns null whenever nobody is reporting — an unpatched Claude Code, a
- * Claude Code that has not started yet, a host that died and left its file
- * behind — and the caller then falls back to what it can work out on its own.
+ * Nested folders can each be open in a window of their own — a sub-project, a
+ * worktree — so the closest folder around the session is the right window. With
+ * no window to raise the answer is empty: a folder nobody has open would open a
+ * new one.
  */
-function presenceOf(pid) {
-  let state;
-  try {
-    state = JSON.parse(fs.readFileSync(path.join(PRESENCE_DIR, `${pid}.json`), "utf-8"));
-  } catch {
-    return null;
-  }
-  return isAlive(state.pid) ? state : null;
-}
-
-/** Every extension host that is reporting its chats right now. */
-function reportingPids() {
-  let files = [];
-  try {
-    files = fs.readdirSync(PRESENCE_DIR);
-  } catch {
-    return [];
-  }
-  return files.map((name) => Number(path.basename(name, ".json"))).filter((pid) => pid > 0);
-}
-
-function chatSurfaces(pid, all) {
-  const state = presenceOf(pid);
-  if (!state) return null;
-  // The sessions list is a webview of its own and names a session without ever
-  // showing it; a report that predates the distinction marks nothing. Whoever
-  // asks for everything wants that entry too — naming a session without showing
-  // it still says the session exists, which silence does not.
-  return all ? state.surfaces || [] : (state.surfaces || []).filter((surface) => surface.chat !== false);
-}
-
-/**
- * The surfaces holding one session, across every reporting window — those that
- * named the session themselves, and only those.
- *
- * A report may also carry a guess, marked as such: a surface told about a
- * session it is not the one showing. Two windows then answer for the same chat,
- * and since the reports are read in pid order, which is to say at random, a
- * guess wins half the time — sending the click to a window that never held the
- * chat, or calling it watched while the real one sits behind a browser. Nothing
- * is decided on a guess; the log keeps them for when a decision looks wrong.
- */
-function surfacesOf(sessionId, all) {
-  if (!sessionId) return [];
-  const found = [];
-  for (const pid of reportingPids()) {
-    const surfaces = chatSurfaces(pid, all);
-    if (!surfaces) continue;
-    for (const surface of surfaces) {
-      if (surface.session === sessionId && !surface.guessed) found.push({ ...surface, pid });
-    }
-  }
-  return found;
-}
-
-/**
- * Whether the window of one extension host has focus.
- *
- * Only our own file answers this. The report of a patched Claude Code carries
- * the same flag, but writes it on chat events, and leaving for another window
- * is not one: it goes on saying "focused" until that chat is touched again, and
- * believing it is how an alert gets swallowed for a window nobody is looking
- * at. A window with no file of ours is not known to be in front, and silence
- * needs certainty.
- */
-function windowFocused(pid) {
-  const state = windowState(pid);
-  return state ? !!state.focused : false;
-}
-
-/**
- * What a patched Claude Code says about this session, across every window it
- * reports: `true` when the chat is on screen in a window that has focus,
- * `false` when the reports cover the session and put it nowhere like that.
- *
- * `null` means they answer nothing about it, and the caller then works it out
- * on its own. Every way of answering nothing ends here: nobody reporting, a
- * report that never names this session, and a report that names it only behind
- * something out of sight while a chat on screen has yet to say whose it is —
- * the side bar a chat has just been moved into says nothing until that chat
- * next speaks, and the bar it came from goes on naming the session.
- */
-function reportedWatch(sessionId) {
-  const surfaces = surfacesOf(sessionId, true);
-  if (surfaces.length === 0) return null;
-  for (const surface of surfaces) {
-    if (surface.chat === false || !surface.visible) continue;
-    if (windowFocused(surface.pid)) return true;
-  }
-  for (const pid of reportingPids()) {
-    if (!windowFocused(pid)) continue;
-    const blind = (chatSurfaces(pid, false) || []).some(
-      (surface) => surface.visible && !surface.session
-    );
-    if (blind) return null;
-  }
-  return false;
-}
-
-/**
- * True when this very chat is in front of the user, so the event needs no
- * panel. A chat sitting in a background tab of the focused window is not: its
- * tab is labelled after the session, and another tab is on top.
- */
-/**
- * The folder a window has open around this session, which is what `open` needs
- * to raise that window. Handing it the session's own directory instead makes
- * VS Code open a second window whenever the two differ — a session started in a
- * subdirectory, a worktree, or a multi-root workspace.
- */
-function windowFolder(cwd, sessionId) {
-  // A window that reports this very session holds the chat, whatever its
-  // folders say — the surest answer there is, when someone is reporting. The
-  // folder around the session is the one to name where the window has one, and
-  // any folder of that window will do where it has not: a session that moved
-  // into another project still lives in this window, and raising it is all the
-  // folder is for.
-  for (const surface of surfacesOf(sessionId)) {
-    const state = windowState(surface.pid);
-    if (!state) continue;
-    const folders = state.folders || [];
-    const around = folders.find((candidate) => isInside(cwd, candidate));
-    if (around) return around;
-    if (folders.length > 0) return folders[0];
-  }
-  // Nested folders can each be open in a window of their own — a sub-project, a
-  // worktree — so the closest folder around the session is the right window.
+function windowFolder(cwd) {
   let closest = "";
   for (const state of windowsFor(cwd)) {
     for (const folder of state.folders || []) {
       if (isInside(cwd, folder) && folder.length > closest.length) closest = folder;
     }
   }
-  // With no window to raise the answer is empty: a folder no window has open
-  // would open a new one.
   return closest;
 }
 
 /**
- * The extension host to leave the request for: the window holding this chat.
+ * Whether the user is already looking at this chat.
  *
- * Same order as raising a window: a window reporting the session itself is the
- * sure answer, and without reports the closest folder around it wins.
- */
-function askWindow(cwd, sessionId) {
-  // A window reporting this very session holds the chat, and its folders have no
-  // say in it: `cd` inside a chat moves the session's working directory, and a
-  // session working in another project's folder belongs to its window all the
-  // same. Matching the folders first sent those clicks to whichever window had
-  // the folder the session had wandered into.
-  for (const surface of surfacesOf(sessionId)) {
-    if (windowState(surface.pid)) return surface.pid;
-  }
-  const windows = windowsFor(cwd);
-  let best = null;
-  let closest = -1;
-  for (const state of windows) {
-    for (const folder of state.folders || []) {
-      if (isInside(cwd, folder) && folder.length > closest) {
-        closest = folder.length;
-        best = state;
-      }
-    }
-  }
-  return best ? best.pid : 0;
-}
-
-/**
- * True when some window has this chat open as a tab. Revealing a tab and
- * opening the side bar are different commands, and asking for the wrong one
- * opens a second copy of the chat in the editor.
- */
-function sessionIsInTab(cwd, sessionId) {
-  const reported = surfacesOf(sessionId);
-  if (reported.length > 0) {
-    // A session can sit in a tab and in the side bar at once, and then the tab
-    // on top of its window is where it is being worked in. That comes first
-    // because the times cannot settle it: every surface of a window is stamped
-    // in the same write, so a session showing in both has the same moment
-    // against each — and the winner would be whichever the report lists first,
-    // which is a side bar.
-    if (reported.some((surface) => surface.kind === "tab" && surface.active)) return true;
-    // Otherwise the one worked in last, where those do differ.
-    const latest = reported.reduce((best, surface) =>
-      (surface.activeAt || 0) > (best.activeAt || 0) ? surface : best
-    );
-    return latest.kind === "tab";
-  }
-
-  const marks = sessionMarks(cwd, sessionId);
-  // Without a transcript no label can be tied to this session, and a guess here
-  // sends the click into someone else's chat. The side bar is the safer miss.
-  if (!marks) return false;
-  return windowsFor(cwd).some((state) =>
-    (state.chatTabs || []).some((label) => tabBelongs(label, marks))
-  );
-}
-
-function sessionIsWatched(cwd, sessionId, agent) {
-  if (agent === "codex") {
-    const window = focusedWindow(cwd);
-    return window ? codexIsWatched(window) : false;
-  }
-
-  // A patched Claude Code names the session behind every surface, and where it
-  // does the answer is exact — whichever window that turns out to be. It is
-  // asked first for that reason: our own way of finding the window can come up
-  // empty where the report is certain, and one source failing must never cost
-  // the other.
-  const reported = reportedWatch(sessionId);
-  if (reported !== null) return reported;
-
-  // Nothing reported about this session. Everything from here is what can be
-  // worked out without help: the window in front, and the labels of its tabs.
-  const window = focusedWindow(cwd);
-  if (!window) return false;
-
-  const marks = sessionMarks(cwd, sessionId);
-  // Nothing to match tabs against: the window is the only thing left to go on.
-  if (!marks) return true;
-  const own = (window.chatTabs || []).filter((label) => tabBelongs(label, marks));
-  // The chat is open as a tab: only the tab on top is in front of the user.
-  if (own.length > 0) return own.includes(window.activeChat);
-  // Otherwise the chat is taken to live in the side bar, which no API can see
-  // into, and a focused window stands for it. That only holds while there is
-  // one window it could be: with the same folder open twice, the focused one
-  // may be the other, and the side bar in front may be showing another chat.
-  return windowsFor(cwd).length === 1;
-}
-
-/** The view containers Codex puts its panel in, as the layout state names them. */
-const CODEX_CONTAINERS = [
-  "workbench.view.extension.codexSecondaryViewContainer",
-  "workbench.view.extension.codexViewContainer",
-];
-
-/**
- * Which view container each side bar of a window is set to, read out of the
- * layout state VS Code keeps for that window. No API tells an extension what
- * another extension's panel is doing; this is the one thing recorded about it,
- * and it is written within a second of the user switching panels.
+ * The answer is one question: is a window with this folder in front. Which chat
+ * that window is showing is not knowable from out here — a side bar is closed
+ * to every API, and working it out from tab titles and transcripts only looked
+ * like an answer, while landing on the wrong chat often enough to be worse than
+ * no answer at all.
  *
- * What it does not record is whether the side bar is open at all: the entry
- * keeps naming the last container through a hidden side bar. So a match means
- * "the panel would be showing", not "it is on screen".
+ * So the trade is deliberate: a chat sitting in a background tab of a focused
+ * window counts as watched, and gets no alert.
  */
-function chosenContainers(state) {
-  if (!state) return [];
-  try {
-    const out = require("child_process").execFileSync(
-      "/usr/bin/sqlite3",
-      [
-        "-readonly",
-        state,
-        "select value from ItemTable where key in ('workbench.auxiliarybar.activepanelid','workbench.sidebar.activeviewletid')",
-      ],
-      { encoding: "utf-8", timeout: 2000 }
-    );
-    return out.split("\n").map((line) => line.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * True when the Codex chat is in front of the user. A chat opened as an editor
- * tab answers exactly — the tab API sees it. For the panel the answer is the
- * container the side bars are set to, and with nothing readable at all the
- * focused window has to stand for the chat, as it does for a Claude side bar.
- */
-function codexIsWatched(window) {
-  if (window.codexTab) return true;
-  const chosen = chosenContainers(window.state);
-  if (chosen.length === 0) return true;
-  return chosen.some((container) => CODEX_CONTAINERS.includes(container));
+function sessionIsWatched(cwd) {
+  return focusedWindow(cwd) !== null;
 }
 
 function compose(kind, input, agent) {
@@ -945,10 +583,7 @@ function record(kind, input, agent) {
     // Every live window, not only the ones whose folders fit the event: a
     // decision that went to the wrong window is explained by the window that was
     // passed over, and narrowing the record to the folder hides exactly that.
-    const windows = liveWindows().map((state) => ({
-      ...state,
-      surfaces: chatSurfaces(state.pid, true),
-    }));
+    const windows = liveWindows();
     const line = JSON.stringify({
       at: new Date().toISOString(),
       kind,
@@ -1003,27 +638,6 @@ function about(what, fallback, read) {
 /** What went wrong while this alert was being put together. */
 let troubles = [];
 
-/**
- * Throw away requests left for windows that are gone. A window takes its own
- * away when it starts, but one that never comes back leaves its file lying
- * there for the pid to come round again.
- */
-function sweepAsks() {
-  let names = [];
-  try {
-    names = fs.readdirSync(ASK_DIR);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    const pid = Number(path.basename(name, ".json"));
-    if (pid && isAlive(pid)) continue;
-    try {
-      fs.unlinkSync(path.join(ASK_DIR, name));
-    } catch {}
-  }
-}
-
 function main(kind, input, agent) {
   const cwd = input.cwd || "";
   const session = input.session_id;
@@ -1034,7 +648,7 @@ function main(kind, input, agent) {
   if (!fs.existsSync(BINARY)) return explain("no alert binary installed");
 
   // Silence needs certainty; anything short of it raises the alert.
-  if (about("whether the chat is watched", false, () => sessionIsWatched(cwd, session, agent))) {
+  if (about("whether the chat is watched", false, () => sessionIsWatched(cwd))) {
     return explain("the chat is in front of the user");
   }
 
@@ -1053,49 +667,6 @@ function main(kind, input, agent) {
           commandsIn((input.tool_input || {}).command, cwd)
         )
       : [];
-  const inTab = about(
-    "which surface holds the chat",
-    false,
-    () => agent !== "codex" && sessionIsInTab(cwd, session)
-  );
-  // The folder raises the window that has it open; what to bring forward inside
-  // it is said separately, and to that window by name. The window is named by
-  // the process of its extension host, which is what watches for the request.
-  const target = about("which window holds the chat", 0, () => askWindow(cwd, session));
-  about("which requests are stale", null, sweepAsks);
-  const askFile = target ? path.join(ASK_DIR, `${target}.json`) : "";
-  const click = target
-    ? JSON.stringify({ action: "reveal", agent, session: session || "", tab: inTab })
-    : "";
-
-  // The link is the way in when no window could be named. It is not sent
-  // alongside a request: VS Code hands a link to the window it likes, brings
-  // that one forward to receive it, and the window just raised for the chat
-  // loses the front again — to the very window the user was leaving.
-  //
-  // And only where some window has the folder open: a link nobody claims makes
-  // VS Code open an empty window for it.
-  const link =
-    !target && windowsFor(cwd).length
-      ? `${REVEAL_URL}?${new URLSearchParams({
-          agent,
-          session: session || "",
-          cwd,
-          // A Codex chat is opened by its panel, which takes no session: the
-          // flag stays out of the link rather than carrying an answer nobody
-          // uses.
-          ...(agent === "codex" ? {} : { tab: inTab ? "1" : "0" }),
-        })}`
-      : "";
-
-  // A permission request can be granted from the alert itself, where the window
-  // holding the chat has the extension that tells it to take the first option.
-  // Everything else gets no such button: a finished task has nothing to answer,
-  // a Codex chat is beyond that extension, and a question has to be read before
-  // it can be answered — taking its first option blind is not an answer.
-  const canAccept =
-    kind === "permission" && agent !== "codex" && target && windowState(target)?.accept;
-  const accept = canAccept ? JSON.stringify({ action: "accept" }) : "";
 
   killPrevious(session);
 
@@ -1109,11 +680,11 @@ function main(kind, input, agent) {
       "--commands", commands.map((one) => `${one.allowed ? "+" : "-"}${one.name}`).join(","),
       "--accent", config.accent,
       "--timeout", String(config.timeout),
-      "--folder", windowFolder(cwd, session),
-      "--url", link,
-      "--ask-file", askFile,
-      "--ask-click", click,
-      "--ask-accept", accept,
+      // All a click does is bring the window forward. Which chat to show inside
+      // it is not this hook's business: from out here the surface holding a
+      // session can only be guessed at — by the folder, by the title of a tab —
+      // and a guess lands the click in somebody else's chat.
+      "--folder", about("which window has this folder", "", () => windowFolder(cwd)),
       // The way to the whole story, offered only when there is one to tell.
       "--log-file", troubles.length > 0 ? LOG_FILE : "",
       "--bundle-id", VSCODE_BUNDLE_ID,

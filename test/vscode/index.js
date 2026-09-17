@@ -143,48 +143,17 @@ async function run() {
     assert.ok(commands.includes("claudeFloatingAlert.showLog"));
   });
 
-  // What a clicked alert leaves for this window, and what becomes of it.
-  const askFile = path.join(ROOT, "ask", `${process.pid}.json`);
-  const leaveAsk = (text) => {
-    // The panel that leaves a request was raised by the hook, and the hook says
-    // so next door — which is what tells the window to start looking out for
-    // one. Writing only the request would be a panel nobody raised.
-    fs.mkdirSync(path.join(ROOT, "run"), { recursive: true });
-    fs.writeFileSync(
-      path.join(ROOT, "run", "test-session.json"),
-      JSON.stringify({ pid: process.pid, cwd: os.tmpdir(), kind: "permission" })
-    );
-    fs.mkdirSync(path.dirname(askFile), { recursive: true });
-    fs.writeFileSync(askFile, text);
-  };
-
-  await check("takes the request a clicked alert leaves", async () => {
-    leaveAsk(JSON.stringify({ action: "accept" }));
-    assert.ok(await until(() => !fs.existsSync(askFile), 5000), "the request should be taken");
-  });
-
-  await check("says on an alert of its own when the answer would not run", async () => {
-    const log = path.join(ROOT, "log.jsonl");
-    const before = fs.existsSync(log) ? fs.readFileSync(log, "utf-8") : "";
-    leaveAsk(JSON.stringify({ action: "accept" }));
-    await until(() => !fs.existsSync(askFile), 5000);
-    const written = await until(() => {
-      const now = fs.existsSync(log) ? fs.readFileSync(log, "utf-8") : "";
-      return now.length > before.length && now.slice(before.length).includes('"ask":"accept"');
-    }, 5000);
-    assert.ok(written, "the attempt should be written down");
-    const line = JSON.parse(fs.readFileSync(log, "utf-8").trim().split("\n").pop());
-    // Nothing here answers requests in a chat, so the command is missing — and
-    // that is the case the user is told about.
-    assert.strictEqual(line.ran, false, "a missing command is not a run one");
-  });
-
-  await check("leaves a half-written request alone until it is whole", async () => {
-    leaveAsk('{"action": "acce');
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    assert.ok(fs.existsSync(askFile), "an unreadable request must not be thrown away");
-    leaveAsk(JSON.stringify({ action: "accept" }));
-    assert.ok(await until(() => !fs.existsSync(askFile), 5000), "and taken once it is whole");
+  await check("says where this window is and whether it is in front", async () => {
+    const file = path.join(ROOT, "focus", `${process.pid}.json`);
+    assert.ok(await until(() => fs.existsSync(file), 5000), "the window should publish itself");
+    const state = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.strictEqual(state.pid, process.pid, "the window is named by its extension host");
+    assert.ok(Array.isArray(state.folders), "the folders are what name the window to `open`");
+    // Nothing about what is showing inside: a click brings the window forward
+    // and stops there, so there is nothing else to publish.
+    for (const gone of ["chatTabs", "activeChat", "codexTab", "accept", "state"]) {
+      assert.ok(!(gone in state), `${gone} is still published`);
+    }
   });
 
   await check("takes its hooks back out again, from both agents", async () => {

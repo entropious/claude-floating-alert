@@ -39,7 +39,7 @@ at.
 3. The agent runs `claude-floating-alert.js` on an event; the script spawns the
    alert as a detached process and exits immediately, so the CLI never blocks.
    Codex registrations pass `--agent codex`, which is what names the agent on
-   the alert and sends a click to the Codex panel.
+   the alert.
 4. Every VS Code window publishes its focus state to
    `~/.claude/floating-alert/focus/<pid>.json`, and the hook writes live panel
    data to `run/<session>.json`. A window is matched to a session by
@@ -56,25 +56,21 @@ and skips new or changed ones silently. Open the Codex panel, go to Hooks in its
 settings, and trust the three entries — the extension reminds you once, right
 after it writes them.
 
-A Codex chat lives in a panel this extension cannot see into: nothing there says
-which session is on screen. What can be told is whether the Codex chat is on
-screen at all — a chat tab of its own, or the panel the side bar is currently
-set to — and that is what decides the alert; a chat behind a side bar you have
-closed entirely still counts as watched. A click opens the Codex panel rather
-than one particular chat.
+What decides the alert is the window, not the chat: if a window with that folder
+is in front, you are taken to be looking at it. No extension can see which chat
+a side bar holds, for Claude Code or for Codex, so a chat sitting in a
+background tab of a focused window counts as watched and stays quiet. A click
+brings the window forward and leaves it at that.
 
 ## What it reads, and what leaves your machine
 
 Nothing leaves your machine. The extension makes no network calls of any kind:
 there is no telemetry, no crash reporting, no update check.
 
-Locally it reads two things. The agent hands the hook the event payload — the
-tool name, the question text, the working directory. And to put the alert next
-to the right editor tab, the hook opens the session transcript at
-`~/.claude/projects/<project>/<session>.jsonl` and takes two values from it: the
-title Claude generated for the session, and the first message you sent. Both are
-compared against VS Code tab labels and then discarded. See
-[`sessionMarks`](hooks/claude-floating-alert.js) for the exact code.
+Locally it reads the event payload the agent hands the hook — the tool name, the
+question text, the working directory — and the `permissions.allow` rules of your
+settings files, to say which commands of a shell line are already allowed. Your
+session transcripts are not opened at all.
 
 One thing worth knowing: the alert is drawn above every application, and it
 shows the folder name plus the tool or question text. On a shared screen or a

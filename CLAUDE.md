@@ -15,8 +15,7 @@ shipped inside the `.vsix`.
 They meet in `~/.claude/floating-alert/`, which the extension fills on
 activation: the hook script, the binary, `config.json` (settings mirrored for
 the hook), `focus/<pid>.json` (one per window), `run/<session>.json` (one per
-live alert), `ask/<pid>.json` (what a clicked alert wants of one window),
-`rules.json` (the allow rules of the settings files, parsed once) and
+live alert), `rules.json` (the allow rules of the settings files, parsed once) and
 `log.jsonl` (one line per event, with what the decision was made on). The path
 is stable across extension updates, which is the point.
 
@@ -24,18 +23,18 @@ What a `Bash` permission alert says about the command it carries — the list of
 commands above it, what each is named, and what the colours mean — is spelled
 out in [`docs/command-colours.md`](docs/command-colours.md).
 
-## A click goes to a window by name
+## A click raises a window, and stops there
 
-Raising the window is the alert's own doing — `open -b <bundle> <folder>` — but
-what to show inside it is left in `ask/<pid>.json`, named after the extension
-host of the window holding that chat, which watches for it. The same file
-carries the accept button's answer.
+`open -b <bundle> <folder>`, and nothing else. What to show inside that window
+is not decided here, because from out here it cannot be: no API says which chat
+a side bar holds, and the ways around that — the titles of chat tabs, the view
+container in the layout state, the session in a transcript — answered a question
+nobody could check, and answered it wrong often enough to land a click in
+someone else's chat.
 
-The obvious channel would be the `vscode://` link, and it is still there for the
-case where no window could be named. It cannot be the main one: VS Code hands a
-link to whichever window it likes — the last active one, which at the moment of
-a click is by definition not the one with the chat — and that window sees a
-folder that is not its own and does nothing at all.
+Whoever lives inside the window can do better, having seen the request as it was
+made, and that is where revealing a chat belongs. The panel takes `--report` and
+says a press on standard output, so a caller that raised it can act on it.
 
 ## Two agents, one hook
 
@@ -43,8 +42,8 @@ Codex fires the same three events from `~/.codex/hooks.json`, in the same file
 shape as `~/.claude/settings.json`, with a payload carrying the same
 `session_id`, `cwd` and `tool_input`. Its registrations pass `--agent codex`,
 and that argument is the only thing telling the two apart: it names the agent on
-the alert and puts `agent=codex` in the link, which sends a click to the Codex
-panel (`chatgpt.openSidebar`) instead of a Claude chat.
+the alert. Everything past that is the same for both — the window is raised, and
+what is inside it is its own business.
 
 **Writing the file is not enough.** Codex keeps a hash of every hook it has been
 shown and runs only the ones the user has trusted; a new or changed entry is
@@ -54,60 +53,26 @@ once, right after wiring, and `.probe/devhost.sh codex` reports whether it has
 been granted. Codex takes a flag to run untrusted hooks anyway; it defeats the
 mechanism, and neither the extension nor the stand uses it.
 
-Everything below about deciding whether the chat is watched is about Claude Code
-alone. A Codex chat sits in a webview of another extension, and nothing reports
-the session behind it, so `codexIsWatched` answers a coarser question — is the
-Codex chat on screen at all — from three things:
+## The one question
 
-1. **A chat tab.** Codex opens chats as editors too (`chatgpt.conversationEditor`
-   on the `openai-codex` scheme), and the tab API sees those exactly.
-2. **The chosen view container.** VS Code records which container each side bar
-   is set to in the layout state of the window (`state.vscdb`, next to the
-   extension storage `context.storageUri` points into), and writes it within a
-   second of a change. Another container means the Codex panel is not showing.
-3. **Window focus**, when neither of those is readable.
+**Is the user already looking at this chat?** An alert that fires while they read
+the answer is noise; one that does not fire when they are away is a missed turn.
 
-What no source gives is whether the side bar is open: the entry keeps naming the
-last container while the bar is hidden, and `auxiliaryBar.hidden` is only written
-when the window closes. A chat behind a closed side bar therefore counts as
-watched. There is no API for this and no plan for one
-(microsoft/vscode#321409), and the alternative — putting a view of our own into
-the Codex container to watch its visibility — costs a permanent extra section in
-someone else's panel and goes silent the moment it is collapsed.
+The answer is a window, not a chat: `sessionIsWatched` asks whether a window
+with this folder is in front, and nothing more. Everything finer was tried and
+taken back out — surface reports from a patched Claude Code, chat tab titles
+matched against the session transcript, the view container a side bar is set to.
+Each was right most of the time and wrong in a way that could not be noticed
+from here, and a click that lands in the wrong chat is worse than one that only
+raises a window.
 
-There is also no surface to reveal on a click: `chatgpt.openSidebar` opens the
-panel on whatever chat it was left on.
+So the trade is stated plainly: **a chat in a background tab of a focused window
+counts as watched**, and gets no alert. What a window publishes about itself is
+just as small — `focus/<pid>.json` with its pid, socket, folders and focus.
 
-## The one hard question
-
-Everything difficult here is one question: **is the user already looking at this
-chat?** An alert that fires while they read the answer is noise; one that does
-not fire when they are away is a missed turn.
-
-Three sources answer it, in falling order of certainty:
-
-1. **Surface reports** — `presence/<pid>.json`, if something is writing them.
-   Each entry names a chat surface, the session behind it, whether it is a tab
-   or the side bar, and whether it is on screen. Exact, per session.
-2. **Tab labels** — `focus/<pid>.json` carries the chat tab titles of a window.
-   `sessionMarks` reads the session transcript for the title Claude generated
-   and the first user message, and `tabBelongs` matches those against the
-   labels. Works without help, breaks when a tab is renamed.
-3. **Window focus alone** — for a side bar chat with nothing else to go on, a
-   focused window is taken to mean the chat is being watched.
-
-`sessionIsWatched` walks exactly that order. **Every fallback must keep
-working**: the reports are optional and absent for most users.
-
-Where do reports come from? A locally patched Claude Code used to publish them,
-and nothing does at the moment: that patch now raises its own alert straight
-from the extension host, where the window and the chat are known by
-construction, and the reports were only ever needed to work that out from
-outside. Treat the format as an interface for whoever writes them next:
-`{ session, kind: "tab"|"sidebar", id, chat, visible, active, activeAt }`,
-`chat: false` meaning a surface that names a session without showing it (the
-sessions list does that). A reader that finds no file, a dead pid, or a field it
-does not know must fall through to 2 and 3 — which is the everyday case now.
+Anything better belongs to whoever is inside the window: it sees the request as
+it is made, knows which chat it came from, and can raise a panel of its own with
+`--report`.
 
 ## Rules learned the hard way
 
@@ -116,11 +81,9 @@ does not know must fall through to 2 and 3 — which is the everyday case now.
   guess, and the binary then only activates the app.
 - **Nested folders both match.** A session in `a/b` fits a window on `a` and a
   window on `a/b`; the closest folder wins, not the first one found.
-- **A session can live in a tab and the side bar at once.** The link has to name
-  the surface it was last worked in (`activeAt`), or a click lands in the wrong
-  one.
-- **Visibility is read at the moment of writing, never remembered.** A view
-  restored with the window resolves hidden and no change event follows.
+- **Which chat a window is showing is not knowable from out here.** Every way of
+  working it out was tried and removed; do not bring one back without a way to
+  tell when it is wrong.
 - **Hooks of other extensions are left alone**, and each hook file is backed up
   before the first change.
 - **Codex is wired only where `~/.codex` exists.** Creating it for someone

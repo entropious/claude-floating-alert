@@ -10,9 +10,10 @@
 //
 //   node test/hook.test.js
 //
-// The cases that matter here are the ones without a presence report: that is
-// how the extension behaves wherever Claude Code is unpatched, and it has to
-// keep working exactly as it did before presence existed.
+// What the hook decides is deliberately small: whether a window with this
+// folder is in front, and which folder a click should bring forward. Nothing
+// here asks what is showing inside a window, because nothing outside it can
+// tell.
 
 const assert = require("assert");
 const fs = require("fs");
@@ -28,7 +29,6 @@ const CWD = "/tmp/project-under-test";
 /** The folder of the second window, open around no session of these tests. */
 const OTHER_CWD = "/tmp/another-project";
 const OTHER_PID = process.ppid;
-const TAB_TITLE = "Fix the parser";
 
 let failures = 0;
 
@@ -49,19 +49,8 @@ function makeHome(options) {
   );
   fs.chmodSync(path.join(root, "bin", "claude-alert"), 0o755);
 
-  // The layout state of the window, in the shape the hook reads it: one row per
-  // side bar, naming the view container it is set to.
-  let state = "";
-  if (options.container) {
-    state = path.join(SANDBOX, "state.vscdb");
-    const sql = [
-      "create table ItemTable (key text primary key, value blob);",
-      `insert into ItemTable values ('workbench.auxiliarybar.activepanelid', '${options.container}');`,
-    ].join("\n");
-    spawnSync("/usr/bin/sqlite3", [state], { input: sql, encoding: "utf-8" });
-  }
-
-  // A live window, since the hook ignores windows whose process is gone.
+  // A live window, since the hook ignores windows whose process is gone. All a
+  // window says about itself is where it is and whether it is in front.
   fs.writeFileSync(
     path.join(root, "focus", `${process.pid}.json`),
     JSON.stringify({
@@ -69,52 +58,24 @@ function makeHome(options) {
       window: "",
       focused: options.focused,
       folders: [CWD],
-      chatTabs: options.chatTabs || [],
-      activeChat: options.activeChat || "",
-      codexTab: options.codexTab || false,
-      accept: options.accept || false,
-      state,
       at: new Date().toISOString(),
     })
   );
 
-  if (options.presence) {
-    const dir = path.join(root, "presence");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(
-      path.join(dir, `${process.pid}.json`),
-      JSON.stringify({ pid: process.pid, folders: [CWD], surfaces: options.presence })
-    );
-  }
-
-  // A second window, for the questions only two of them can ask: which one holds
-  // the chat, and which one a click belongs to. Its pid is this process's parent
-  // — any live one will do, and the hook only asks whether it is still running.
+  // A second window, for what only two of them can be asked. Its pid is this
+  // process's parent — any live one will do, and the hook only asks whether it
+  // is still running.
   if (options.other) {
-    const folders = options.other.folders || [OTHER_CWD];
     fs.writeFileSync(
       path.join(root, "focus", `${OTHER_PID}.json`),
       JSON.stringify({
         pid: OTHER_PID,
         window: "",
         focused: !!options.other.focused,
-        folders,
-        chatTabs: [],
-        activeChat: "",
-        codexTab: false,
-        accept: false,
-        state: "",
+        folders: options.other.folders || [OTHER_CWD],
         at: new Date().toISOString(),
       })
     );
-    if (options.other.presence) {
-      const dir = path.join(root, "presence");
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, `${OTHER_PID}.json`),
-        JSON.stringify({ pid: OTHER_PID, folders, surfaces: options.other.presence })
-      );
-    }
   }
 
   // The rules the user has allowed, read from the settings of their own home.
@@ -124,14 +85,6 @@ function makeHome(options) {
       JSON.stringify({ permissions: { allow: options.allow } })
     );
   }
-
-  // The transcript is what the tab-label fallback matches against.
-  const projects = path.join(home, ".claude", "projects", CWD.replace(/[/.]/g, "-"));
-  fs.mkdirSync(projects, { recursive: true });
-  fs.writeFileSync(
-    path.join(projects, `${SESSION}.jsonl`),
-    JSON.stringify({ type: "user", message: { content: TAB_TITLE } }) + "\n"
-  );
 
   return { home, spawned };
 }
@@ -181,7 +134,7 @@ function test(name, body) {
   }
 }
 
-console.log("without a presence report");
+console.log("deciding whether to alert, and which window a click raises");
 
 test("alerts when the window is not focused", () => {
   const args = runHook("stop", { focused: false });
@@ -193,30 +146,20 @@ test("stays quiet for a side bar chat in the focused window", () => {
   assert.strictEqual(runHook("stop", { focused: true }), null);
 });
 
-test("alerts when the chat tab is not the one on top", () => {
-  const args = runHook("permission", {
-    focused: true,
-    chatTabs: [TAB_TITLE],
-    activeChat: "some other tab",
-  });
-  assert.ok(args, "an alert should have been raised");
-  assert.match(flag(args, "--ask-click"), /"tab":true/, "the click should reveal the tab");
+test("stays quiet whatever the focused window is showing", () => {
+  // The window in front stands for the chat, and nothing else is consulted:
+  // which chat a side bar holds is not knowable from out here, and the ways
+  // around that — tab titles, transcripts — pointed at the wrong chat often
+  // enough to be worse than no answer.
+  assert.strictEqual(runHook("permission", { focused: true }), null);
 });
 
-test("stays quiet when the chat tab is the one on top", () => {
-  const args = runHook("permission", {
-    focused: true,
-    chatTabs: [TAB_TITLE],
-    activeChat: TAB_TITLE,
-  });
-  assert.strictEqual(args, null);
-});
-
-test("asks for the side bar when no tab holds the chat", () => {
+test("asks the window for nothing but coming forward", () => {
   const args = runHook("stop", { focused: false });
-  assert.match(flag(args, "--ask-click"), /"tab":false/);
-  assert.match(flag(args, "--ask-file"), new RegExp(`ask/${process.pid}\\.json$`));
-  assert.strictEqual(flag(args, "--url"), "", "a named window is asked, not linked");
+  assert.strictEqual(flag(args, "--folder"), CWD, "the window to raise is named by its folder");
+  for (const gone of ["--ask-file", "--ask-click", "--ask-accept", "--url"]) {
+    assert.strictEqual(args.indexOf(gone), -1, `${gone} is still handed to the alert`);
+  }
 });
 
 test("raises no window of its own when nothing has the folder open", () => {
@@ -332,189 +275,13 @@ test("reads a heredoc body as data rather than as commands", () => {
   assert.strictEqual(flag(args, "--commands"), "-git commit");
 });
 
-test("offers to answer where a window says it can", () => {
-  const args = runHook("permission", { focused: false, accept: true });
-  assert.match(flag(args, "--ask-accept"), /"action":"accept"/);
-});
-
-test("offers no answer where no window can give one", () => {
-  const args = runHook("permission", { focused: false });
-  assert.strictEqual(flag(args, "--ask-accept"), "");
-});
-
-test("offers no answer for a finished task", () => {
-  const args = runHook("stop", { focused: false, accept: true });
-  assert.strictEqual(flag(args, "--ask-accept"), "");
-});
-
-test("offers no answer to a question, which has to be read first", () => {
-  const args = runHook("permission", {
-    focused: false,
-    accept: true,
-    payload: { tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Which?" }] } },
-  });
-  assert.strictEqual(flag(args, "--ask-accept"), "");
-});
-
-console.log("with a presence report");
-
-test("stays quiet when the reported chat is visible", () => {
-  const args = runHook("stop", {
-    focused: true,
-    presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
-  });
-  assert.strictEqual(args, null);
-});
-
-test("alerts when the reported chat is hidden", () => {
-  const args = runHook("stop", {
-    focused: true,
-    presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 2 }],
-  });
-  assert.ok(args, "a hidden chat is not one the user is looking at");
-});
-
-test("stays quiet when a chat on screen has yet to name its session", () => {
-  // The chat has just been moved into the other side bar: the surface it came
-  // from still names the session behind a bar nobody sees, and the one showing
-  // it says nothing until that chat next speaks.
-  const args = runHook("stop", {
-    focused: true,
-    presence: [
-      { session: SESSION, kind: "sidebar", id: "claudeVSCodeSidebar", chat: true, visible: false, activeAt: 2 },
-      { session: "", kind: "sidebar", id: "claudeVSCodeSidebarSecondary", chat: true, visible: true, activeAt: 3 },
-    ],
-  });
-  assert.strictEqual(args, null);
-});
-
-test("alerts when every chat on screen belongs to another session", () => {
-  const args = runHook("stop", {
-    focused: true,
-    presence: [
-      { session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 2 },
-      { session: "another-session", kind: "sidebar", chat: true, visible: true, activeAt: 3 },
-    ],
-  });
-  assert.ok(args, "the chat on screen is a different one");
-});
-
-test("ignores the sessions list, which shows no chat", () => {
-  const args = runHook("stop", {
-    focused: true,
-    presence: [{ session: SESSION, kind: "sidebar", chat: false, visible: true, activeAt: 2 }],
-  });
-  assert.ok(args, "the sessions list is not a chat on screen");
-});
-
-test("stays quiet for a session the report never mentions", () => {
-  // A chat tab whose session the patch has not published yet: the report names
-  // the side bar only, and saying nothing about this session is not the same as
-  // saying it is hidden.
-  const args = runHook("stop", {
-    focused: true,
-    presence: [{ session: "another-session", kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
-  });
-  assert.strictEqual(args, null, "an unmentioned session falls back to the window, not to an alert");
-});
-
-test("aims at the tab on top when the side bar holds the same session", () => {
-  const args = runHook("permission", {
-    focused: false,
-    presence: [
-      { session: SESSION, kind: "sidebar", chat: true, visible: true, active: true, activeAt: 5 },
-      { session: SESSION, kind: "tab", chat: true, visible: true, active: true, activeAt: 5 },
-    ],
-  });
-  assert.match(flag(args, "--ask-click"), /"tab":true/, "the tab on top is where the work is");
-});
-
-test("links to the surface the session was last worked in", () => {
-  const args = runHook("stop", {
-    focused: true,
-    presence: [
-      { session: SESSION, kind: "tab", chat: true, visible: false, activeAt: 1 },
-      { session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 9 },
-    ],
-  });
-  assert.match(flag(args, "--ask-click"), /"tab":false/, "the side bar was the later of the two");
-});
-
-test("sends the click to the window reporting the session, not the one on its folder", () => {
-  // Two windows, a chat in the side bar of each. The event comes from the chat
-  // of the second, whose folder is not the one the event carries.
-  const args = runHook("permission", {
-    focused: false,
-    presence: [{ session: "another-session", kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
-    other: {
-      focused: false,
-      presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
-    },
-  });
+test("alerts from the window in the background, whoever else is in front", () => {
+  // Two windows, the event from the one that is not focused. Nothing is asked
+  // about the chat inside it: the folder names the window, and that is all a
+  // click needs.
+  const args = runHook("stop", { focused: false, other: { focused: true } });
   assert.ok(args, "an alert should have been raised");
-  assert.match(
-    flag(args, "--ask-file"),
-    new RegExp(`ask/${OTHER_PID}\\.json$`),
-    "the click went to the window that merely had the folder open"
-  );
-  assert.strictEqual(flag(args, "--folder"), OTHER_CWD, "the wrong window would be raised");
-});
-
-test("keeps the window of a session that is working in another project's folder", () => {
-  // `cd` inside a chat moves the session's working directory, and the window
-  // around it does not follow: the event then carries a folder belonging to a
-  // different window, while the chat is where it always was.
-  const args = runHook("permission", {
-    focused: false,
-    payload: { cwd: OTHER_CWD },
-    presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
-    other: { focused: false },
-  });
-  assert.ok(args, "an alert should have been raised");
-  assert.match(
-    flag(args, "--ask-file"),
-    new RegExp(`ask/${process.pid}\\.json$`),
-    "the click followed the working directory instead of the chat"
-  );
-  assert.strictEqual(flag(args, "--folder"), CWD, "the folder named is not the one around the chat");
-});
-
-test("passes over a window that only guessed at the session", () => {
-  // A report may carry a session a surface was told about rather than one it
-  // shows, marked as a guess. Here the second window guesses at the chat of the
-  // first, and its folder is the one the event carries — everything that could
-  // draw the click to it, short of actually holding the chat.
-  const args = runHook("permission", {
-    focused: false,
-    payload: { cwd: OTHER_CWD },
-    presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: true, activeAt: 2 }],
-    other: {
-      focused: false,
-      presence: [
-        { session: SESSION, guessed: true, kind: "sidebar", chat: true, visible: true, activeAt: 3 },
-      ],
-    },
-  });
-  assert.ok(args, "an alert should have been raised");
-  assert.match(
-    flag(args, "--ask-file"),
-    new RegExp(`ask/${process.pid}\\.json$`),
-    "a guess took the click from the window that holds the chat"
-  );
-});
-
-test("does not call a chat watched on a guess", () => {
-  // The focused window guesses at a session whose chat is in the other one. A
-  // guess says nothing about what is on screen, so the alert stands.
-  const args = runHook("permission", {
-    focused: true,
-    presence: [{ session: SESSION, guessed: true, kind: "sidebar", chat: true, visible: true }],
-    other: {
-      focused: false,
-      presence: [{ session: SESSION, kind: "sidebar", chat: true, visible: false, activeAt: 2 }],
-    },
-  });
-  assert.ok(args, "the guess passed for the chat being in front of the user");
+  assert.strictEqual(flag(args, "--folder"), CWD, "the window to raise is not the one that asked");
 });
 
 console.log("with Codex as the agent");
@@ -526,43 +293,14 @@ test("alerts for Codex when the window is not focused", () => {
 });
 
 test("stays quiet for Codex while its window is focused", () => {
-  // With no layout state to read, a focused window has to stand for the chat.
+  // The focused window stands for the chat, for Codex as for anyone: what its
+  // panel is showing is no more knowable than what a side bar holds.
   assert.strictEqual(runHook("stop", { focused: true }, "codex"), null);
 });
 
-test("stays quiet when the side bar is set to the Codex panel", () => {
-  const args = runHook(
-    "stop",
-    { focused: true, container: "workbench.view.extension.codexSecondaryViewContainer" },
-    "codex"
-  );
-  assert.strictEqual(args, null);
-});
-
-test("alerts when the side bar is set to another panel", () => {
-  const args = runHook(
-    "stop",
-    { focused: true, container: "workbench.view.extension.claude-sidebar-secondary" },
-    "codex"
-  );
-  assert.ok(args, "the Codex chat cannot be on screen while another panel is chosen");
-});
-
-test("stays quiet when a Codex chat is the tab on top", () => {
-  const args = runHook(
-    "stop",
-    { focused: true, codexTab: true, container: "workbench.view.extension.claude-sidebar-secondary" },
-    "codex"
-  );
-  assert.strictEqual(args, null, "a chat tab in front outranks whatever the side bar shows");
-});
-
-test("ignores the chat tabs of Claude Code when Codex fired", () => {
-  const args = runHook("permission", { focused: false, chatTabs: [TAB_TITLE] }, "codex");
+test("names Codex on the alert it fired", () => {
+  const args = runHook("permission", { focused: false }, "codex");
   assert.strictEqual(flag(args, "--title"), "Codex needs permission");
-  const click = flag(args, "--ask-click");
-  assert.match(click, /"agent":"codex"/, "the request has to name the agent to open the right panel");
-  assert.match(click, /"tab":false/, "a Codex panel is opened by no tab of ours");
 });
 
 fs.rmSync(SANDBOX, { recursive: true, force: true });
