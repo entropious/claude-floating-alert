@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.1
+
+- Text handed over already coloured is set a couple of points larger than plain
+  text: 14 for the command, 15 for the list above it. It is the thing the alert
+  is read for, and colours help only once the words are legible.
+
 ## 2.0.0
 
 - A click brings the window forward and stops there. Which chat to show inside

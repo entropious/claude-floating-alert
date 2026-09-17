@@ -577,7 +577,9 @@ final class Controller: NSObject {
     ///
     /// Only the colours are taken from the markup. Type sizes belong to the
     /// panel — the reader turns CSS into fonts of its own reckoning, and text
-    /// half the size of everything around it reads as a mistake.
+    /// half the size of everything around it reads as a mistake. Coloured text
+    /// is set a couple of points larger than plain: it is the thing the alert
+    /// is read for, and the colours only help once the words are legible.
     ///
     /// The trailing newline the HTML reader adds after a block is dropped: the
     /// panel lays the lines out itself, and an extra one is a blank row.
@@ -612,7 +614,7 @@ final class Controller: NSObject {
     private func bodyText() -> NSAttributedString {
         // Already coloured by someone who read the line properly: drawn as
         // given, with the trouble lines of this run still appended below.
-        if let given = fromHTML(opts.bodyHTML, font: NSFont.systemFont(ofSize: 12)) {
+        if let given = fromHTML(opts.bodyHTML, font: NSFont.systemFont(ofSize: 14)) {
             let out = NSMutableAttributedString(attributedString: given)
             for line in opts.body.components(separatedBy: "\n") where line.hasPrefix(TROUBLE_MARK) {
                 out.append(
@@ -741,7 +743,9 @@ final class Controller: NSObject {
     /// The commands of the line, in green where they are already allowed and in
     /// red where they are not. Nil when there is nothing to list.
     private func commandList() -> NSAttributedString? {
-        if let given = fromHTML(opts.commandsHTML, font: NSFont.systemFont(ofSize: 13, weight: .semibold)) { return given }
+        if let given = fromHTML(opts.commandsHTML, font: NSFont.systemFont(ofSize: 15, weight: .semibold)) {
+            return given
+        }
         let marked = opts.commands.split(separator: ",").map(String.init).filter { $0.count > 1 }
         guard !marked.isEmpty else { return nil }
         let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
