@@ -99,12 +99,15 @@ Three sources answer it, in falling order of certainty:
 `sessionIsWatched` walks exactly that order. **Every fallback must keep
 working**: the reports are optional and absent for most users.
 
-Where do reports come from? A locally patched Claude Code publishes them; the
-patch is not part of this repository and cannot be assumed. Treat the format as
-an interface: `{ session, kind: "tab"|"sidebar", id, chat, visible, active,
-activeAt }`, `chat: false` meaning a surface that names a session without
-showing it (the sessions list does that). A reader that finds no file, a dead
-pid, or a field it does not know must fall through to 2 and 3.
+Where do reports come from? A locally patched Claude Code used to publish them,
+and nothing does at the moment: that patch now raises its own alert straight
+from the extension host, where the window and the chat are known by
+construction, and the reports were only ever needed to work that out from
+outside. Treat the format as an interface for whoever writes them next:
+`{ session, kind: "tab"|"sidebar", id, chat, visible, active, activeAt }`,
+`chat: false` meaning a surface that names a session without showing it (the
+sessions list does that). A reader that finds no file, a dead pid, or a field it
+does not know must fall through to 2 and 3 — which is the everyday case now.
 
 ## Rules learned the hard way
 

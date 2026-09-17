@@ -12,8 +12,13 @@
 //   claude-alert --title "..." --body "..." [--subtitle "..."] [--accent orange]
 //                [--timeout 0] [--folder /path] [--url vscode://…]
 //                [--ask-file /path] [--ask-click json] [--ask-accept json]
+//                [--body-html "<div>…"] [--commands-html "<div>…"] [--report]
 //                [--log-file /path]
 //                [--bundle-id id]
+//
+// A caller that raised the panel itself can hand over the text already coloured
+// and ask for `--report`, and then what was pressed comes back on standard
+// output instead of through a file some window has to be watching.
 
 import AppKit
 
@@ -42,6 +47,17 @@ struct Options {
     /// The commands of the line being asked about, each marked `+` where the
     /// user has already allowed it and `-` where they have not.
     var commands = ""
+    /// The same two things already coloured, for a caller that knows the line
+    /// better than the panel can. The panel understands no shell grammar and no
+    /// editor theme; whoever does hands over marked-up text, and it is drawn as
+    /// given. Empty means the panel falls back to what it can work out itself.
+    var bodyHTML = ""
+    var commandsHTML = ""
+    /// Say what was pressed on standard output instead of only leaving it in a
+    /// file. For a caller that started the panel itself there is nothing to
+    /// arrange: the answer comes back down the pipe it already holds, and no
+    /// window has to be watching a directory for it.
+    var report = false
     var bundleID = "com.microsoft.VSCode"
 }
 
@@ -68,6 +84,9 @@ func parseArgs() -> Options {
         case "--ask-accept": o.askAccept = take()
         case "--log-file": o.logFile = take()
         case "--commands": o.commands = take()
+        case "--body-html": o.bodyHTML = take()
+        case "--commands-html": o.commandsHTML = take()
+        case "--report": o.report = true
         case "--bundle-id": o.bundleID = take()
         case "--timeout": o.timeout = Double(take()) ?? 0
         default: break
@@ -160,7 +179,7 @@ final class Controller: NSObject {
     private var hasClose: Bool { opts.timeout <= 0 }
     /// Only where something on the other side can answer the request.
     private var hasAccept: Bool {
-        !opts.askFile.isEmpty && !opts.askAccept.isEmpty && !acceptExpired
+        (!opts.askFile.isEmpty || opts.report) && !opts.askAccept.isEmpty && !acceptExpired
     }
     /// Whether the answer button has stood past its use.
     private var acceptExpired = false
@@ -184,6 +203,9 @@ final class Controller: NSObject {
         let room = (screen?.visibleFrame.height ?? 800) * 0.7 - 90
         return max(collapsedLines, Int(room / 15))
     }
+    /// Whether there is a line to show at all. It can arrive as plain text or
+    /// already coloured, and either one is a body.
+    private var hasBody: Bool { !opts.body.isEmpty || !opts.bodyHTML.isEmpty }
     /// A body that does not fit its five lines gets an arrow to unfold it.
     private lazy var hasExpand: Bool = {
         guard !opts.body.isEmpty else { return false }
@@ -225,7 +247,7 @@ final class Controller: NSObject {
         // around it: only the last lines are cut short, the ones above keep the
         // full width. Without a body there is nothing to flow, and the button
         // gets a line of its own below the text.
-        let flows = accept != nil && !opts.body.isEmpty
+        let flows = accept != nil && hasBody
 
         let title = label(opts.title, size: 14, weight: .bold, color: .labelColor, lines: 2)
         var textViews: [NSView] = [title]
@@ -237,7 +259,7 @@ final class Controller: NSObject {
             textViews.append(view)
             listView = view
         }
-        if !opts.body.isEmpty {
+        if hasBody {
             // What is cut off is said by a line of dots under the text: the last
             // line of a command ends in an ellipsis of its own often enough for
             // one there to say nothing.
@@ -532,13 +554,53 @@ final class Controller: NSObject {
         dismiss()
     }
 
-    /// Leave a request for the window holding the chat, which watches for it.
+    /// Leave a request for the window holding the chat, which watches for it —
+    /// and say the same thing on standard output where the caller is listening
+    /// there. The two are the same request; which way it travels depends only
+    /// on who raised the panel.
     private func ask(_ body: String) {
-        guard !opts.askFile.isEmpty, !body.isEmpty else { return }
+        guard !body.isEmpty else { return }
+        if opts.report {
+            print(body)
+            fflush(stdout)
+        }
+        guard !opts.askFile.isEmpty else { return }
         // Written whole or not at all: the window watches that directory, and a
         // file it finds empty because the writing is still going on is a
         // request it cannot read.
         try? Data(body.utf8).write(to: URL(fileURLWithPath: opts.askFile), options: .atomic)
+    }
+
+    /// Text a caller handed over already coloured. Nil for an empty string and
+    /// for anything that will not parse — the panel then colours it itself, and
+    /// an alert is never lost to a piece of markup.
+    ///
+    /// Only the colours are taken from the markup. Type sizes belong to the
+    /// panel — the reader turns CSS into fonts of its own reckoning, and text
+    /// half the size of everything around it reads as a mistake.
+    ///
+    /// The trailing newline the HTML reader adds after a block is dropped: the
+    /// panel lays the lines out itself, and an extra one is a blank row.
+    private func fromHTML(_ html: String, font: NSFont) -> NSAttributedString? {
+        guard !html.isEmpty, let data = html.data(using: .utf8) else { return nil }
+        guard
+            let read = try? NSAttributedString(
+                data: data,
+                options: [
+                    .documentType: NSAttributedString.DocumentType.html,
+                    .characterEncoding: String.Encoding.utf8.rawValue,
+                ],
+                documentAttributes: nil
+            )
+        else { return nil }
+
+        let out = NSMutableAttributedString(attributedString: read)
+        while out.string.hasSuffix("\n") {
+            out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1))
+        }
+        guard out.length > 0 else { return nil }
+        out.addAttribute(.font, value: font, range: NSRange(location: 0, length: out.length))
+        return out
     }
 
     /// The body of a permission alert, coloured where it is a shell command:
@@ -548,6 +610,23 @@ final class Controller: NSObject {
     /// that prefix is what says the rest is a command at all. Anything else is
     /// prose and stays one colour.
     private func bodyText() -> NSAttributedString {
+        // Already coloured by someone who read the line properly: drawn as
+        // given, with the trouble lines of this run still appended below.
+        if let given = fromHTML(opts.bodyHTML, font: NSFont.systemFont(ofSize: 12)) {
+            let out = NSMutableAttributedString(attributedString: given)
+            for line in opts.body.components(separatedBy: "\n") where line.hasPrefix(TROUBLE_MARK) {
+                out.append(
+                    NSAttributedString(
+                        string: "\n\(line)",
+                        attributes: [
+                            .font: NSFont.systemFont(ofSize: 12),
+                            .foregroundColor: NSColor.systemRed,
+                        ]
+                    )
+                )
+            }
+            return out
+        }
         let font = NSFont.systemFont(ofSize: 12)
         // What went wrong is marked by the hook and comes after the event
         // itself; it is written in the colour of trouble so that a detail
@@ -662,6 +741,7 @@ final class Controller: NSObject {
     /// The commands of the line, in green where they are already allowed and in
     /// red where they are not. Nil when there is nothing to list.
     private func commandList() -> NSAttributedString? {
+        if let given = fromHTML(opts.commandsHTML, font: NSFont.systemFont(ofSize: 13, weight: .semibold)) { return given }
         let marked = opts.commands.split(separator: ",").map(String.init).filter { $0.count > 1 }
         guard !marked.isEmpty else { return nil }
         let font = NSFont.systemFont(ofSize: 13, weight: .semibold)

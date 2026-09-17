@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.0
+
+- The panel draws text it is handed already coloured: `--body-html` for the
+  command and `--commands-html` for the list above it. It understands no shell
+  grammar and no editor theme, so a caller that reads the line properly — with
+  a shell grammar, against the palette of the active theme — can hand over
+  marked-up text instead. Only the colours are taken from the markup; the type
+  sizes stay the panel's own.
+- With `--report`, what was pressed is said on standard output as well as left
+  in a file. A caller that started the panel itself then needs nothing arranged:
+  the answer comes back down the pipe it already holds, and no window has to
+  watch a directory for it.
+
 ## 1.7.4
 
 - A click goes to the window holding the chat, whatever folder the session is
