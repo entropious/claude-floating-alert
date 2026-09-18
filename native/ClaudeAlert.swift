@@ -594,7 +594,7 @@ final class Controller: NSObject {
     private func bodyText() -> NSAttributedString {
         // Already coloured by someone who read the line properly: drawn as
         // given, with the trouble lines of this run still appended below.
-        if let given = fromHTML(opts.bodyHTML, font: NSFont.systemFont(ofSize: 14)) {
+        if let given = fromHTML(opts.bodyHTML, font: NSFont.systemFont(ofSize: 13)) {
             let out = NSMutableAttributedString(attributedString: given)
             for line in opts.body.components(separatedBy: "\n") where line.hasPrefix(TROUBLE_MARK) {
                 out.append(
@@ -723,7 +723,7 @@ final class Controller: NSObject {
     /// The commands of the line, in green where they are already allowed and in
     /// red where they are not. Nil when there is nothing to list.
     private func commandList() -> NSAttributedString? {
-        if let given = fromHTML(opts.commandsHTML, font: NSFont.systemFont(ofSize: 15, weight: .semibold)) {
+        if let given = fromHTML(opts.commandsHTML, font: NSFont.systemFont(ofSize: 14, weight: .semibold)) {
             return given
         }
         let marked = opts.commands.split(separator: ",").map(String.init).filter { $0.count > 1 }
