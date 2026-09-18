@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.2
+
+- Weight survives the markup: a caller can hand over bold text — command names,
+  say — and it is drawn bold. The panel still sets the size itself.
+- How tall the text will be is measured on what will be drawn rather than on the
+  plain copy of it, so the arrow that unfolds a long command appears where a
+  caller hands the line over as markup only.
+
 ## 2.0.1
 
 - Text handed over already coloured is set a couple of points larger than plain

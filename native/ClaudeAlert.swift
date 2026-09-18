@@ -10,8 +10,8 @@
 //
 // Usage:
 //   claude-alert --title "..." --body "..." [--subtitle "..."] [--accent orange]
-//                [--timeout 0] [--folder /path] [--url vscode://…]
-//                [--ask-file /path] [--ask-click json] [--ask-accept json]
+//                [--timeout 0] [--folder /path]
+//                [--ask-click json] [--ask-accept json]
 //                [--body-html "<div>…"] [--commands-html "<div>…"] [--report]
 //                [--log-file /path]
 //                [--bundle-id id]
@@ -32,13 +32,9 @@ struct Options {
     var timeout: Double = 0
     /// Folder to hand the app, which brings the window holding it forward.
     var folder = ""
-    /// Deep link opened once that window is in front, to reveal the chat. Used
-    /// where no window could be named, and empty when there is none to tell.
-    var url = ""
-    /// File the window holding the chat watches, and what to leave in it: on a
-    /// click on the panel, and on the accept button. An empty body means that
-    /// way in is not offered — no button for the second one.
-    var askFile = ""
+    /// What to say on a press, where the caller asked to hear it: on a click on
+    /// the panel, and on the answer button. An empty body means that button is
+    /// not offered at all.
     var askClick = ""
     var askAccept = ""
     /// Log to open from the panel. Handed over only when something went wrong
@@ -78,8 +74,6 @@ func parseArgs() -> Options {
         case "--body": o.body = take()
         case "--accent": o.accent = take()
         case "--folder": o.folder = take()
-        case "--url": o.url = take()
-        case "--ask-file": o.askFile = take()
         case "--ask-click": o.askClick = take()
         case "--ask-accept": o.askAccept = take()
         case "--log-file": o.logFile = take()
@@ -177,12 +171,8 @@ final class Controller: NSObject {
     /// An alert that closes itself needs no button; one that waits for an answer
     /// has to be dismissible without going to the chat it came from.
     private var hasClose: Bool { opts.timeout <= 0 }
-    /// Only where something on the other side can answer the request.
-    private var hasAccept: Bool {
-        (!opts.askFile.isEmpty || opts.report) && !opts.askAccept.isEmpty && !acceptExpired
-    }
-    /// Whether the answer button has stood past its use.
-    private var acceptExpired = false
+    /// Only where somebody is listening for the answer.
+    private var hasAccept: Bool { opts.report && !opts.askAccept.isEmpty }
     /// Only where the alert has something to explain.
     private var hasLog: Bool { !opts.logFile.isEmpty }
     private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
@@ -208,8 +198,12 @@ final class Controller: NSObject {
     private var hasBody: Bool { !opts.body.isEmpty || !opts.bodyHTML.isEmpty }
     /// A body that does not fit its five lines gets an arrow to unfold it.
     private lazy var hasExpand: Bool = {
-        guard !opts.body.isEmpty else { return false }
-        return lines(opts.body, width: textWidth) > collapsedLines
+        // Measured on what will be drawn rather than on the plain text: a
+        // caller may hand the line over as markup only, and then there is no
+        // plain copy of it to measure.
+        let shown = bodyText().string
+        guard !shown.isEmpty else { return false }
+        return lines(shown, width: textWidth) > collapsedLines
     }()
     /// The panel is as tall as what is in it: the padding around the text is
     /// what keeps a short alert from looking like a sliver, and a minimum on top
@@ -470,18 +464,6 @@ final class Controller: NSObject {
         )
     }
 
-    /// Takes the answer button away once the alert has stood long enough for
-    /// the request behind it to be anyone's guess.
-    ///
-    /// The window listens for the answer for a while after the event and then
-    /// stops; a button that outlives that listening promises an answer nobody
-    /// is waiting for. The panel itself stays — the event still happened.
-    @objc private func expireAccept() {
-        guard hasAccept else { return }
-        acceptExpired = true
-        redraw()
-    }
-
     /// The row of answers along the bottom: what went wrong, and what can be
     /// done about the request without leaving what you are doing.
     private func buttonsRow() -> NSView? {
@@ -554,21 +536,12 @@ final class Controller: NSObject {
         dismiss()
     }
 
-    /// Leave a request for the window holding the chat, which watches for it —
-    /// and say the same thing on standard output where the caller is listening
-    /// there. The two are the same request; which way it travels depends only
-    /// on who raised the panel.
+    /// Say on standard output what was pressed, where the caller asked to hear
+    /// it. Whoever raised the panel is holding that pipe already.
     private func ask(_ body: String) {
-        guard !body.isEmpty else { return }
-        if opts.report {
-            print(body)
-            fflush(stdout)
-        }
-        guard !opts.askFile.isEmpty else { return }
-        // Written whole or not at all: the window watches that directory, and a
-        // file it finds empty because the writing is still going on is a
-        // request it cannot read.
-        try? Data(body.utf8).write(to: URL(fileURLWithPath: opts.askFile), options: .atomic)
+        guard opts.report, !body.isEmpty else { return }
+        print(body)
+        fflush(stdout)
     }
 
     /// Text a caller handed over already coloured. Nil for an empty string and
@@ -601,7 +574,14 @@ final class Controller: NSObject {
             out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1))
         }
         guard out.length > 0 else { return nil }
-        out.addAttribute(.font, value: font, range: NSRange(location: 0, length: out.length))
+
+        // The size is the panel's, the weight is the markup's: command names
+        // arrive bold, and that is what picks them out of their arguments.
+        let bold = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
+        out.enumerateAttribute(.font, in: NSRange(location: 0, length: out.length)) { value, range, _ in
+            let heavy = (value as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) ?? false
+            out.addAttribute(.font, value: heavy ? bold : font, range: range)
+        }
         return out
     }
 
@@ -1031,21 +1011,13 @@ final class Controller: NSObject {
     /// app comes forward on whatever window was in front — which is the window
     /// the user is leaving, not the one the alert is about.
     private func openTarget() {
-        // The window is told what to show before it is raised: it watches for
-        // the request either way, and this way the chat is already coming up as
-        // the window arrives.
+        // The press is said before the window is raised: whoever is listening
+        // can have the chat already coming up as the window arrives.
         ask(opts.askClick)
         if !opts.folder.isEmpty { raiseUntilFront(opts.folder) }
         // Which app: whatever window the editor now has in front is the one that
         // comes up with it, which is why this goes last.
         runOpen(["-b", opts.bundleID])
-        guard !opts.url.isEmpty else { return }
-        // `open` returns before the window is actually in front, and a link
-        // arriving too early finds no window to belong to — VS Code then opens
-        // an empty one for it. Waiting for the app to come forward costs
-        // nothing when it already is, which is the common case for a click.
-        waitUntilFront()
-        runOpen([opts.url])
     }
 
     /// Ask for the window until it says it is in front.
@@ -1120,16 +1092,6 @@ final class Controller: NSObject {
         task.waitUntilExit()
     }
 
-    /// Blocks until the editor is the frontmost app, or until the wait has gone
-    /// on long enough to be a failure rather than a slow activation.
-    private func waitUntilFront() {
-        let deadline = Date().addingTimeInterval(0.5)
-        while Date() < deadline {
-            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == opts.bundleID { return }
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-    }
-
     /// Hand a folder or a link to the editor.
     ///
     /// `open` talks to the editor the system knows, which is the one the user
@@ -1155,10 +1117,6 @@ final class Controller: NSObject {
         for (number, act) in [
             (SIGUSR1, #selector(runAction)),
             (SIGUSR2, #selector(accept)),
-            // The window has stopped listening for an answer, so the button
-            // that would send one goes away. The panel stays: the event it is
-            // about still happened.
-            (SIGHUP, #selector(expireAccept)),
         ] {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
