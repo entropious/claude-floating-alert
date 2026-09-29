@@ -1145,8 +1145,11 @@ final class Controller: NSObject {
 let options = parseArgs()
 
 let app = NSApplication.shared
-// .accessory: no Dock icon, no menu bar, and the panel never steals activation.
-app.setActivationPolicy(.accessory)
+// .prohibited: the process can never become the active app. The alert is
+// spawned from inside VS Code, and macOS lets a child of the frontmost app
+// activate itself on launch — with .accessory it took focus from the window the
+// user was typing in. The panel is non-activating and takes clicks without it.
+app.setActivationPolicy(.prohibited)
 let controller = Controller(opts: options)
 // Before anything is drawn: until these are taken, either signal is a way to
 // kill the process outright, and one arriving early would take the panel with

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.4
+
+- The alert no longer takes focus from the window you are typing in. Spawned from
+  inside VS Code, it was a child of the frontmost app, and macOS let it activate
+  itself on launch. The process now runs with the `.prohibited` activation policy
+  and can never become the active app; the panel is non-activating and takes
+  clicks without it.
+
 ## 2.0.2
 
 - Weight survives the markup: a caller can hand over bold text — command names,
