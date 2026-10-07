@@ -14,7 +14,7 @@
 //                [--ask-click json] [--ask-accept json]
 //                [--body-html "<div>…"] [--commands-html "<div>…"] [--report]
 //                [--log-file /path]
-//                [--bundle-id id]
+//                [--bundle-id id] [--width 520]
 //
 // A caller that raised the panel itself can hand over the text already coloured
 // and ask for `--report`, and then what was pressed comes back on standard
@@ -55,6 +55,9 @@ struct Options {
     /// window has to be watching a directory for it.
     var report = false
     var bundleID = "com.microsoft.VSCode"
+    /// Width of the panel in points. Never more than 40% of the screen, so a
+    /// small screen does not lose half of itself to an alert.
+    var width: Double = 520
 }
 
 func parseArgs() -> Options {
@@ -83,6 +86,7 @@ func parseArgs() -> Options {
         case "--report": o.report = true
         case "--bundle-id": o.bundleID = take()
         case "--timeout": o.timeout = Double(take()) ?? 0
+        case "--width": o.width = Double(take()) ?? o.width
         default: break
         }
     }
@@ -150,9 +154,16 @@ final class ClickableSurface: NSView {
 /// the command unfolds it instead of going where a click on the panel goes.
 final class ClickableBox: NSView {
     var onClick: (() -> Void)?
+    /// The scroll view inside, when the text is taller than the screen allows.
+    /// The box takes every hit, so the wheel has to be handed on to it.
+    weak var scroller: NSScrollView?
 
     override func mouseDown(with event: NSEvent) {
         onClick?()
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if let scroller { scroller.scrollWheel(with: event) } else { super.scrollWheel(with: event) }
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -167,15 +178,28 @@ final class Controller: NSObject {
     /// Kept alive for as long as the panel is: a signal source stops on release.
     private var presses: [DispatchSourceSignal] = []
 
-    private let width: CGFloat = 450
+    /// Settled once, on the screen the panel comes up on: a width that changed
+    /// between redraws would move the text under the pointer.
+    private lazy var width: CGFloat = {
+        let room = (currentScreen()?.visibleFrame.width ?? 1440) * 0.4
+        return max(320, min(CGFloat(opts.width), room))
+    }()
+    /// The folded panel is a strip with one line on it, and it needs no more.
+    private var stripWidth: CGFloat { min(width, 320) }
     /// An alert that closes itself needs no button; one that waits for an answer
     /// has to be dismissible without going to the chat it came from.
     private var hasClose: Bool { opts.timeout <= 0 }
+    /// The same alerts can be folded out of the way: they stay up until
+    /// answered, and a request that can wait should not cover what is behind it.
+    private var hasFold: Bool { hasClose }
+    /// Folded into a strip at the corner: the request is still open, the panel
+    /// only takes less room until it is unfolded.
+    private var folded = false
     /// Only where somebody is listening for the answer.
     private var hasAccept: Bool { opts.report && !opts.askAccept.isEmpty }
     /// Only where the alert has something to explain.
     private var hasLog: Bool { !opts.logFile.isEmpty }
-    private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) }
+    private var textWidth: CGFloat { width - 34 - (hasClose ? 26 : 0) - (hasFold ? 26 : 0) }
     /// Whether the whole command is on screen, or only its first lines.
     private var expanded = false
     /// Long commands wrap instead of being cut off, up to this many lines —
@@ -186,12 +210,26 @@ final class Controller: NSObject {
     /// for — the title above it only says which kind of event this is. A shade
     /// off the full label colour keeps the title first all the same.
     private let bodyColor = NSColor.labelColor.withAlphaComponent(0.82)
-    /// A command longer than the screen is cut off even expanded; the whole of
-    /// it is in the chat, and the alert is not where it gets read.
+    /// Expanded, the panel grows up to most of the screen's height. A command
+    /// taller than that scrolls inside the panel instead of being cut off.
     private var expandedLines: Int {
-        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-        let room = (screen?.visibleFrame.height ?? 800) * 0.7 - 90
-        return max(collapsedLines, Int(room / 15))
+        max(collapsedLines, Int(bodyRoom / 15))
+    }
+    /// Height the body may take when expanded: most of the screen, less what
+    /// the title, the list and the buttons around it need.
+    private var bodyRoom: CGFloat {
+        (currentScreen()?.visibleFrame.height ?? 800) * 0.85 - 120
+    }
+    /// The body is taller than the room it gets expanded, so it scrolls.
+    private var scrolls: Bool { expanded && fullBodyHeight > bodyRoom }
+    private lazy var fullBodyHeight: CGFloat = {
+        let shown = bodyText()
+        guard shown.length > 0 else { return 0 }
+        return measuredHeight(shown, width: textWidth)
+    }()
+
+    private func currentScreen() -> NSScreen? {
+        NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
     }
     /// Whether there is a line to show at all. It can arrive as plain text or
     /// already coloured, and either one is a body.
@@ -215,6 +253,7 @@ final class Controller: NSObject {
     }
 
     private func content() -> ClickableSurface {
+        if folded { return strip() }
         let accent = accentColor(opts.accent)
 
         let container = ClickableSurface()
@@ -240,8 +279,9 @@ final class Controller: NSObject {
         // The button hangs over the bottom-right corner of the body, which flows
         // around it: only the last lines are cut short, the ones above keep the
         // full width. Without a body there is nothing to flow, and the button
-        // gets a line of its own below the text.
-        let flows = accept != nil && hasBody
+        // gets a line of its own below the text. Scrolling text has no last
+        // line to cut short, so the button gets its own line there too.
+        let flows = accept != nil && hasBody && !scrolls
 
         let title = label(opts.title, size: 14, weight: .bold, color: .labelColor, lines: 2)
         var textViews: [NSView] = [title]
@@ -259,7 +299,12 @@ final class Controller: NSObject {
             // one there to say nothing.
             let cut = hasExpand && !expanded
             var text: NSView
-            if let accept, flows, !cut {
+            var scroller: NSScrollView?
+            if scrolls {
+                let view = scrollingBody(bodyText(), height: bodyRoom)
+                scroller = view
+                text = view
+            } else if let accept, flows, !cut {
                 let size = accept.fittingSize
                 text = flowingBody(bodyText(), around: NSSize(width: size.width + 12, height: size.height))
             } else {
@@ -282,6 +327,7 @@ final class Controller: NSObject {
             if hasExpand {
                 let box = ClickableBox()
                 box.onClick = { [weak self] in self?.toggleExpanded() }
+                box.scroller = scroller
                 box.translatesAutoresizingMaskIntoConstraints = false
                 box.addSubview(text)
                 NSLayoutConstraint.activate([
@@ -364,19 +410,133 @@ final class Controller: NSObject {
                 rest.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 6),
             ]
         }
+        constraints += cornerButtons(in: container, top: 8)
+        NSLayoutConstraint.activate(constraints)
+        return container
+    }
+
+    /// The close button in the top-right corner and the fold arrow left of it.
+    /// The arrow points where the panel goes: down into a strip while it is
+    /// open, up out of the strip while it is folded.
+    private func cornerButtons(in container: ClickableSurface, top: CGFloat) -> [NSLayoutConstraint] {
+        var constraints: [NSLayoutConstraint] = []
+        var edge = container.trailingAnchor
+        var inset: CGFloat = -8
         if hasClose {
             let close = closeButton()
             container.addSubview(close)
             container.passthrough.append(close)
             constraints += [
-                close.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
-                close.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+                close.trailingAnchor.constraint(equalTo: edge, constant: inset),
+                close.topAnchor.constraint(equalTo: container.topAnchor, constant: top),
                 close.widthAnchor.constraint(equalToConstant: 30),
                 close.heightAnchor.constraint(equalToConstant: 30),
             ]
+            edge = close.leadingAnchor
+            inset = 4
         }
+        if hasFold {
+            let fold = foldButton()
+            container.addSubview(fold)
+            container.passthrough.append(fold)
+            constraints += [
+                fold.trailingAnchor.constraint(equalTo: edge, constant: inset),
+                fold.topAnchor.constraint(equalTo: container.topAnchor, constant: top),
+                fold.widthAnchor.constraint(equalToConstant: 30),
+                fold.heightAnchor.constraint(equalToConstant: 30),
+            ]
+        }
+        return constraints
+    }
+
+    /// The panel folded into a strip: the colour of the event, the workspace
+    /// and what it is about, on one line. A click on it does what a click on
+    /// the panel does; the arrow brings the panel back as it was.
+    private func strip() -> ClickableSurface {
+        let accent = accentColor(opts.accent)
+        let container = ClickableSurface()
+        container.onClick = { [weak self] in self?.runAction() }
+        container.appearance = NSAppearance(named: .darkAqua)
+        container.wantsLayer = true
+        container.layer?.backgroundColor = PANEL_BACKGROUND.cgColor
+        container.layer?.cornerRadius = 10
+        container.layer?.cornerCurve = .continuous
+        container.layer?.masksToBounds = true
+        container.layer?.borderWidth = 1
+        container.layer?.borderColor = accent.withAlphaComponent(0.5).cgColor
+
+        let stripe = NSView()
+        stripe.wantsLayer = true
+        stripe.layer?.backgroundColor = accent.cgColor
+        stripe.translatesAutoresizingMaskIntoConstraints = false
+
+        let said = NSMutableAttributedString()
+        if !opts.subtitle.isEmpty {
+            said.append(
+                NSAttributedString(
+                    string: "\(opts.subtitle) \u{00B7} ",
+                    attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: accent]
+                )
+            )
+        }
+        said.append(
+            NSAttributedString(
+                string: opts.title,
+                attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor]
+            )
+        )
+        let line = NSTextField(labelWithAttributedString: said)
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.lineBreakMode = .byTruncatingTail
+        line.maximumNumberOfLines = 1
+        line.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        container.addSubview(stripe)
+        container.addSubview(line)
+        var constraints: [NSLayoutConstraint] = [
+            container.heightAnchor.constraint(equalToConstant: 38),
+            container.widthAnchor.constraint(equalToConstant: stripWidth),
+            stripe.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stripe.topAnchor.constraint(equalTo: container.topAnchor),
+            stripe.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            stripe.widthAnchor.constraint(equalToConstant: 4),
+            line.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            line.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            line.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -74),
+        ]
+        constraints += cornerButtons(in: container, top: 4)
         NSLayoutConstraint.activate(constraints)
         return container
+    }
+
+    /// Folds the panel into a strip, or brings it back the way it was. The
+    /// request stays open either way, so the press is no answer to it — it is
+    /// said as a resize, which the caller has no reason to act on.
+    private func foldButton() -> NSButton {
+        let button = NSButton()
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.title = ""
+        button.image = NSImage(
+            systemSymbolName: folded ? "chevron.up" : "chevron.down",
+            accessibilityDescription: folded ? "Unfold" : "Fold"
+        )?.withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+        button.contentTintColor = .secondaryLabelColor
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = #selector(toggleFolded)
+        button.toolTip = folded ? "Unfold" : "Fold"
+        return button
+    }
+
+    @objc private func toggleFolded() {
+        folded.toggle()
+        if opts.report {
+            print("{\"action\":\"resize\",\"state\":\"\(folded ? "folded" : "open")\"}")
+            fflush(stdout)
+        }
+        redraw()
     }
 
     func show() {
@@ -417,8 +577,7 @@ final class Controller: NSObject {
     }
 
     private func placeBottomRight(width: CGFloat, height: CGFloat) {
-        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-        guard let visible = screen?.visibleFrame else { return }
+        guard let visible = currentScreen()?.visibleFrame else { return }
         panel.setFrameOrigin(NSPoint(x: visible.maxX - width - 16, y: visible.minY + 16))
     }
 
@@ -454,12 +613,13 @@ final class Controller: NSObject {
         let container = content()
         container.layoutSubtreeIfNeeded()
         let height = max(container.fittingSize.height, minHeight)
+        let wide = folded ? stripWidth : width
         let frame = panel.frame
         panel.contentView = container
-        // The origin stays where it is and the height grows from it: the panel
-        // sits in the bottom corner, so the text unfolds upwards.
+        // The bottom-right corner stays where it is: the panel sits there, so
+        // it grows upwards and to the left, and folds back into the corner.
         panel.setFrame(
-            NSRect(x: frame.minX, y: frame.minY, width: width, height: height),
+            NSRect(x: frame.maxX - wide, y: frame.minY, width: wide, height: height),
             display: true
         )
     }
@@ -945,6 +1105,48 @@ final class Controller: NSObject {
         return view
     }
 
+    /// Height of the text laid out at a width, with nothing clamping it.
+    private func measuredHeight(_ text: NSAttributedString, width: CGFloat) -> CGFloat {
+        let storage = NSTextStorage(attributedString: text)
+        let layout = NSLayoutManager()
+        let box = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        box.lineFragmentPadding = 0
+        layout.addTextContainer(box)
+        storage.addLayoutManager(layout)
+        layout.ensureLayout(for: box)
+        return ceil(layout.usedRect(for: box).maxY)
+    }
+
+    /// The whole body in a box of the given height that scrolls: a command
+    /// taller than the screen is still all there, a wheel away.
+    private func scrollingBody(_ text: NSAttributedString, height: CGFloat) -> NSScrollView {
+        let full = measuredHeight(text, width: textWidth)
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: textWidth, height: full))
+        view.textStorage?.setAttributedString(text)
+        view.isEditable = false
+        view.isSelectable = false
+        view.drawsBackground = false
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = true
+        view.isVerticallyResizable = true
+        view.isHorizontallyResizable = false
+        view.autoresizingMask = [.width]
+
+        let scroller = NSScrollView()
+        scroller.translatesAutoresizingMaskIntoConstraints = false
+        scroller.drawsBackground = false
+        scroller.hasVerticalScroller = true
+        scroller.autohidesScrollers = true
+        scroller.scrollerStyle = .overlay
+        scroller.documentView = view
+        NSLayoutConstraint.activate([
+            scroller.widthAnchor.constraint(equalToConstant: textWidth),
+            scroller.heightAnchor.constraint(equalToConstant: min(full, height)),
+        ])
+        return scroller
+    }
+
     /// A label of text that carries its own colours, wrapped and clamped the
     /// same way a plain one is.
     private func coloured(_ text: NSAttributedString, lines: Int) -> NSTextField {
@@ -1117,6 +1319,11 @@ final class Controller: NSObject {
         for (number, act) in [
             (SIGUSR1, #selector(runAction)),
             (SIGUSR2, #selector(accept)),
+            // SIGINFO is ignored by default, so a stray one does nothing worse
+            // than fold the panel. It stands for the arrow, and SIGWINCH for a
+            // click on the text that unfolds a long command.
+            (SIGINFO, #selector(toggleFolded)),
+            (SIGWINCH, #selector(toggleExpanded)),
         ] {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)

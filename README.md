@@ -24,9 +24,14 @@ for your choice. Also stays until you answer.
 
 <img src="media/alert-stop.png" width="460" alt="Claude is done — task finished, waiting for you">
 
-The alert has no buttons: a click anywhere on it opens the matching folder in
-VS Code and dismisses it. You never see one for a window you are already looking
-at.
+A click anywhere on the alert opens the matching folder in VS Code and dismisses
+it. You never see one for a window you are already looking at.
+
+An alert that waits for an answer has two buttons in its corner: × closes it, and
+the arrow folds it into a one-line strip at the corner of the screen — the
+request stays open, the alert only gets out of the way — and back. A long
+command unfolds on a click on its text, up to most of the screen's height, and
+scrolls beyond that.
 
 ## How it works
 

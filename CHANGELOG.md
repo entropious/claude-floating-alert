@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.0
+
+- The alert is wider: 520 points instead of 450, and never more than 40% of the
+  screen. `--width` sets another width.
+- An unfolded long command takes up to 85% of the screen's height instead of
+  70%, and what does not fit scrolls inside the alert instead of being cut off.
+- An alert that waits for an answer can be folded: the arrow next to × turns it
+  into a one-line strip at the corner — workspace and title — and brings it back
+  as it was. Folding answers nothing. Under `--report` it is said as
+  `{"action":"resize","state":"folded"|"open"}`, which a caller has no reason to
+  act on.
+
 ## 2.0.4
 
 - The alert no longer takes focus from the window you are typing in. Spawned from
